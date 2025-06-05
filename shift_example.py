@@ -506,8 +506,7 @@ class MLPPixelShifter(nn.Module):
     Multi-Layer Perceptron that predicts pixel shifts based on eye position.
 
     This model learns to map eye positions (in degrees) to pixel shifts that
-    compensate for eye movements. The key insight is that small eye movements
-    can be corrected by shifting the stimulus in the opposite direction.
+    compensate for errors in calibration. 
 
     Parameters:
     -----------
