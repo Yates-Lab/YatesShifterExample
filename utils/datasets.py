@@ -260,7 +260,7 @@ def generate_gaborium_dataset(exp, ks_results, roi_src, pix_interp, ep_interp, v
         return None
 def generate_gratings_dataset(exp, ks_results, roi_src, 
                               pix_interp, ep_interp, valid_interp, dt=1/240, 
-                              metadata={}, trial_subset=1):
+                              metadata={}):
     protocols = get_trial_protocols(exp)
     ptb2ephys, _ = get_clock_functions(exp)
     st = ks_results.spike_times
@@ -269,12 +269,7 @@ def generate_gratings_dataset(exp, ks_results, roi_src,
 
     # Export Gratings dataset
     trials = [(iT, GratingsTrial(exp['D'][iT], exp['S'])) for iT in range(len(exp['D'])) if protocols[iT] == 'ForageGrating']
-    print(f'There are {len(trials)} Gratings trials. Using {trial_subset*100:.0f}% of them.')
-    n_trials = int(len(trials) * trial_subset)
-    print(f'Using {n_trials} trials.')
-    trial_inds = np.random.choice(len(trials), n_trials, replace=False)
-    trial_inds = np.sort(trial_inds)
-    trials = [trials[iT] for iT in trial_inds]
+    print(f'There are {len(trials)} Gratings trials.')
     gratings_dict = {
             't_bins': [],
             'stim': [],
@@ -288,7 +283,7 @@ def generate_gratings_dataset(exp, ks_results, roi_src,
             'roi': [],
             'trial_inds': [],
         }
-    for iT, trial in tqdm(trials, 'Gratings trials'):
+    for iT, trial in tqdm(trials, 'Generating Gratings dataset'):
         # get flip times in ephys time
         flip_times = ptb2ephys(trial.flip_times)
 

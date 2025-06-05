@@ -1,792 +1,1736 @@
+# ============================================================================
+# NEURAL DATA ANALYSIS WITH EYE MOVEMENT CORRECTION ("SHIFTER" MODEL)
+# ============================================================================
+#
+# This notebook demonstrates how to analyze neural responses to visual stimuli
+# while an animal is making natural eye movements. The main goal is to build a 
+# "shifter" model that can correct for small inaccuracies in calibration and
+# compensate for the resulting stimulus misalignment. Finally, we will evaluate
+# the performance of the shifter model using drifting gratings and measure
+# the improvement in phase tuning precision.
+# ============================================================================
+
 #%%
+# ============================================================================
+# 1. IMPORT LIBRARIES AND SET UP ENVIRONMENT
+# ============================================================================
+
+# Standard scientific computing libraries
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import pandas as pd
 
-import os
+# PyTorch for deep learning
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Scipy for signal processing and interpolation
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import interp1d
+
+# Custom utility modules for neural data analysis
 from utils.loss import PoissonBPSAggregator
-from utils.modules import SplitRelu, NonparametricReadout
+from utils.modules import SplitRelu, NonparametricReadout, StackedConv2d
 from utils.datasets import DictDataset, generate_gaborium_dataset, generate_gratings_dataset
 from utils.general import set_seeds, ensure_tensor
 from utils.grid_sample import grid_sample_coords
 from utils.rf import calc_sta, plot_stas
-from scipy.ndimage import gaussian_filter
-from utils.modules import StackedConv2d 
-from utils.exp.general import get_clock_functions, get_trial_protocols 
-from utils.spikes import KilosortResults
-from matplotlib.patches import Circle
-from scipy.interpolate import interp1d
+from utils.exp.general import get_clock_functions, get_trial_protocols
 from utils.exp.dots import dots_rf_map_session
-from pathlib import Path
+from utils.spikes import KilosortResults
+
+# Matplotlib utilities
+from matplotlib.patches import Circle
+
+# MATLAB file loading
 from mat73 import loadmat
-import pandas as pd
-# potential speedup for matmul
-torch.set_float32_matmul_precision('medium')
 
-set_seeds(1002) # for reproducibility
+# ============================================================================
+# CONFIGURATION AND SETUP
+# ============================================================================
 
-device = 'cuda'
+# Set random seeds for reproducibility across runs
+RANDOM_SEED = 1002
+set_seeds(RANDOM_SEED)
+
+# Configure PyTorch for optimal performance
+torch.set_float32_matmul_precision('medium')  # Trade precision for speed
+
+# Set device for computation (GPU if available, otherwise CPU)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+# Define data directory path
 data_dir = Path('/home/ryanress/YatesShifterExample/data')
 
+#%%
+# ============================================================================
+# 2. LOAD EXPERIMENTAL DATA AND EYE TRACKING
+# ============================================================================
+
+# Load experimental metadata and stimulus information
 exp_file = data_dir / 'Allen_2022-04-13_struct.mat'
 exp = loadmat(exp_file)
+print(f"Loaded experiment file: {exp_file}")
+
+# Extract timing conversion functions for synchronizing different data streams
+# ptb2ephys converts PsychToolbox timestamps to electrophysiology timestamps
 ptb2ephys, vpx2ephys = get_clock_functions(exp)
 
+# Load spike sorting results from Kilosort4
 ks4_dir = data_dir / 'Allen_2022-04-13_ks4'
 ks_results = KilosortResults(ks4_dir)
-st = ks_results.spike_times
-clu = ks_results.spike_clusters
-cids = np.unique(clu)
+spike_times = ks_results.spike_times  # When each spike occurred
+spike_clusters = ks_results.spike_clusters  # Which neuron each spike came from
+cluster_ids = np.unique(spike_clusters)  # List of all neuron IDs
+print(f"Loaded {len(cluster_ids)} neurons with {len(spike_times)} total spikes")
 
+# Load eye tracking data (DPI = Digital Pupil Imaging)
 ddpi_file = data_dir / 'Allen_2022-04-13_ddpi.csv'
-dpi = pd.read_csv(ddpi_file)
-t_ephys = dpi['t_ephys'].values
-dpi_pix = dpi[['dpi_i', 'dpi_j']].values
-dpi_valid = dpi['valid'].values
-dpi_interp = interp1d(t_ephys, dpi_pix, kind='linear', fill_value='extrapolate', axis=0)
-valid_interp = interp1d(t_ephys, dpi_valid, kind='nearest', fill_value='extrapolate')
+eye_data = pd.read_csv(ddpi_file)
+eye_times = eye_data['t_ephys'].values  # Timestamps for eye position samples
+eye_positions_pixels = eye_data[['dpi_i', 'dpi_j']].values  # Eye position in screen pixels
+eye_valid = eye_data['valid'].values  # Whether eye tracking was reliable at each time
 
-# Convert DPI signal from pixel locations to degrees (using small angle approximation)
-# Metadata for all datasets
+# Create interpolation functions for eye position data
+# This allows us to estimate eye position at any time point
+eye_pos_interp = interp1d(eye_times, eye_positions_pixels,
+                         kind='linear', fill_value='extrapolate', axis=0)
+eye_valid_interp = interp1d(eye_times, eye_valid,
+                           kind='nearest', fill_value='extrapolate')
+
+# ============================================================================
+# CONVERT EYE POSITIONS FROM PIXELS TO DEGREES OF VISUAL ANGLE
+# ============================================================================
+# Visual angle is the standard unit for measuring stimulus size in vision research
+# It accounts for viewing distance and screen size
+
+# Extract screen parameters from experiment metadata
 screen_resolution = (exp['S']['screenRect'][2:] - exp['S']['screenRect'][:2]).astype(int)
-screen_width = exp['S']['screenWidth']
-screen_distance = exp['S']['screenDistance']
-screen_height = screen_width * screen_resolution[1] / screen_resolution[0]
-center_pix = np.flipud((screen_resolution + 1) / 2)
+screen_width_cm = exp['S']['screenWidth']  # Physical width in centimeters
+screen_distance_cm = exp['S']['screenDistance']  # Distance from eye to screen
+screen_height_cm = screen_width_cm * screen_resolution[1] / screen_resolution[0]
+screen_center_pixels = np.flipud((screen_resolution + 1) / 2)
 
-ppd = exp['S']['pixPerDeg'] # pixels per degree
-dpi_deg = (dpi_pix - center_pix) / ppd
-dpi_deg[:,0] *= -1
-dpi_deg = dpi_deg[:,[1,0]]
-dpi_deg_interp = interp1d(t_ephys, dpi_deg, kind='linear', fill_value='extrapolate', axis=0)
+# Convert pixels to degrees using the calibrated conversion factor
+pixels_per_degree = exp['S']['pixPerDeg']
+eye_positions_degrees = (eye_positions_pixels - screen_center_pixels) / pixels_per_degree
+
+# Flip and reorder coordinates to match standard conventions
+# (azimuth = horizontal, elevation = vertical)
+eye_positions_degrees[:, 0] *= -1  # Flip azimuth direction
+eye_positions_degrees = eye_positions_degrees[:, [1, 0]]  # Swap to [azimuth, elevation]
+
+# Create interpolation function for eye positions in degrees
+eye_pos_deg_interp = interp1d(eye_times, eye_positions_degrees,
+                             kind='linear', fill_value='extrapolate', axis=0)
+
+print(f"Screen: {screen_resolution[0]}x{screen_resolution[1]} pixels, "
+      f"{screen_width_cm:.1f}x{screen_height_cm:.1f} cm")
+print(f"Viewing distance: {screen_distance_cm:.1f} cm")
+print(f"Pixels per degree: {pixels_per_degree:.1f}")
 #%%
+# ============================================================================
+# 3. RECEPTIVE FIELD MAPPING
+# ============================================================================
+# Map the spatial receptive fields of neurons using spike-triggered averages
+# This tells us which part of the visual field each neuron responds to
 
-# Parameters for RF mapping 
-dt = 1/240 # seconds
-lags = np.arange(7, 14) # frames
-rf_roi_deg = np.array([[-4, 4], [-4, 4]]) # [[az0, az1], [el0, el1]]
-dxy_deg = .25 # degrees
+# Temporal parameters for receptive field analysis
+FRAME_RATE = 240  # Hz - stimulus refresh rate
+dt = 1 / FRAME_RATE  # Time per frame in seconds
+rf_lags = np.arange(7, 14)  # Frame delays to analyze (captures neural response latency)
 
-rf_dict = dots_rf_map_session(exp, dpi, ks_results,
-                              dt=dt, lags=lags, roi_deg=rf_roi_deg, dxy_deg=dxy_deg)
-rf = rf_dict['rf']
-j_edges = rf_dict['j_edges']
-i_edges = rf_dict['i_edges']
-rf_pix = rf_dict['rf_pix']
-rf_deg = rf_dict['rf_deg']
+# Spatial parameters for receptive field mapping
+rf_roi_degrees = np.array([[-4, 4], [-4, 4]])  # [azimuth_range, elevation_range] in degrees
+rf_spatial_resolution = 0.25  # degrees per pixel in RF map
 
+print(f"Mapping receptive fields with {len(rf_lags)} time lags "
+      f"({rf_lags[0]*dt*1000:.1f}-{rf_lags[-1]*dt*1000:.1f} ms)")
+print(f"Spatial region: {rf_roi_degrees[0][0]}° to {rf_roi_degrees[0][1]}° azimuth, "
+      f"{rf_roi_degrees[1][0]}° to {rf_roi_degrees[1][1]}° elevation")
+
+# Compute receptive fields using dots stimulus
+rf_results = dots_rf_map_session(exp, eye_data, ks_results,
+                                dt=dt, lags=rf_lags,
+                                roi_deg=rf_roi_degrees, dxy_deg=rf_spatial_resolution)
+
+# Extract results
+receptive_field_map = rf_results['rf']  # 2D map of neural response strength
+azimuth_edges = rf_results['j_edges']  # Pixel coordinates for azimuth axis
+elevation_edges = rf_results['i_edges']  # Pixel coordinates for elevation axis
+rf_center_pixels = rf_results['rf_pix']  # Center of RF in pixel coordinates
+rf_center_degrees = rf_results['rf_deg']  # Center of RF in degrees
+
+print(f"Receptive field center: [{rf_center_degrees[0]:.1f}°, {rf_center_degrees[1]:.1f}°] "
+      f"(pixels: [{rf_center_pixels[0]}, {rf_center_pixels[1]}])")
 
 #%%
-# Parameters for dataset rois
-roi_r = 1.5 # degrees
-r_pix = int(roi_r * ppd)
-roi_src = np.stack([rf_pix - r_pix, rf_pix + r_pix + 1], axis=1)
+# ============================================================================
+# VISUALIZE RECEPTIVE FIELD AND DEFINE ANALYSIS REGION
+# ============================================================================
 
-plt.figure()
-plt.imshow(rf, extent=[j_edges[0], j_edges[-1], i_edges[-1], i_edges[0]], aspect='auto')
-plt.axvline(0, color='aliceblue', linestyle='--', alpha=.5)
-plt.axhline(0, color='aliceblue', linestyle='--', alpha=.5)
-for r in np.arange(1, 5):
-    plt.gca().add_patch(Circle((0, 0), r*ppd, fill=False, color='aliceblue', linestyle='--', alpha=.5))
-    plt.text(np.sqrt(2)/2*r*ppd+10, -np.sqrt(2)/2*r*ppd+10, f'{r}°', color='aliceblue', fontsize=14)
-plt.plot([roi_src[1, 0], roi_src[1, 1], roi_src[1, 1], roi_src[1, 0], roi_src[1, 0]],
-        [roi_src[0, 0], roi_src[0, 0], roi_src[0, 1], roi_src[0, 1], roi_src[0, 0]], 'r')
-plt.plot([rf_pix[1]], [rf_pix[0]], 'rx', markersize=10)
+# Define region of interest around the receptive field center
+roi_radius_degrees = 1.5  # degrees
+roi_radius_pixels = int(roi_radius_degrees * pixels_per_degree)
+
+# Create bounding box for analysis region (in pixel coordinates)
+analysis_roi = np.stack([rf_center_pixels - roi_radius_pixels,
+                        rf_center_pixels + roi_radius_pixels + 1], axis=1)
+
+# Create visualization of receptive field map
+plt.figure(figsize=(8, 6))
+plt.imshow(receptive_field_map,
+          extent=[azimuth_edges[0], azimuth_edges[-1],
+                 elevation_edges[-1], elevation_edges[0]],
+          aspect='auto', cmap='viridis')
+
+# Add reference lines and circles
+plt.axvline(0, color='white', linestyle='--', alpha=0.7, label='Screen center')
+plt.axhline(0, color='white', linestyle='--', alpha=0.7)
+
+# Add degree markers
+for radius in np.arange(1, 5):
+    circle = Circle((0, 0), radius * pixels_per_degree,
+                   fill=False, color='white', linestyle='--', alpha=0.7)
+    plt.gca().add_patch(circle)
+    # Add degree labels
+    label_x = np.sqrt(2)/2 * radius * pixels_per_degree + 10
+    label_y = -np.sqrt(2)/2 * radius * pixels_per_degree + 10
+    plt.text(label_x, label_y, f'{radius}°', color='white', fontsize=12)
+
+# Highlight the analysis region
+roi_corners_x = [analysis_roi[1, 0], analysis_roi[1, 1], analysis_roi[1, 1],
+                analysis_roi[1, 0], analysis_roi[1, 0]]
+roi_corners_y = [analysis_roi[0, 0], analysis_roi[0, 0], analysis_roi[0, 1],
+                analysis_roi[0, 1], analysis_roi[0, 0]]
+plt.plot(roi_corners_x, roi_corners_y, 'red', linewidth=2, label='Analysis ROI')
+
+# Mark RF center
+plt.plot(rf_center_pixels[1], rf_center_pixels[0], 'rx', markersize=12,
+         markeredgewidth=3, label='RF center')
+
 plt.colorbar(label='Spike rate (Hz)')
-plt.title(f'Forward Correlation ({lags[0]*dt*1000:.1f}-{lags[-1]*dt*1000:.1f} ms)\nRF: {rf_deg[0]:.1f}°, {rf_deg[1]:.1f}° | pix: [{rf_pix[0]}, {rf_pix[1]}]')
-plt.xlabel('Pixels (azimuth)')
-plt.ylabel('Pixels (elevation)')
+plt.title(f'Receptive Field Map ({rf_lags[0]*dt*1000:.1f}-{rf_lags[-1]*dt*1000:.1f} ms)\n'
+          f'RF Center: {rf_center_degrees[0]:.1f}°, {rf_center_degrees[1]:.1f}° '
+          f'(pixels: [{rf_center_pixels[0]}, {rf_center_pixels[1]}])')
+plt.xlabel('Azimuth (pixels)')
+plt.ylabel('Elevation (pixels)')
+plt.legend()
+plt.tight_layout()
 plt.show()
 
 #%%
-protocols = get_trial_protocols(exp)
+# ============================================================================
+# 4. DATASET GENERATION AND LOADING
+# ============================================================================
+# Generate or load the main dataset used for training the shifter model
 
-metadata={
+# Get information about all experimental protocols
+experimental_protocols = get_trial_protocols(exp)
+print(f"Found {len(experimental_protocols)} experimental protocols")
+
+# Create metadata dictionary to store experimental parameters
+experiment_metadata = {
     'screen_resolution': screen_resolution,
-    'screen_width': screen_width,
-    'screen_height': screen_height,
-    'screen_distance': screen_distance,
-    'ppd': ppd,
-    'roi_src': roi_src,
+    'screen_width': screen_width_cm,
+    'screen_height': screen_height_cm,
+    'screen_distance': screen_distance_cm,
+    'pixels_per_degree': pixels_per_degree,
+    'analysis_roi': analysis_roi,
 }
 
-#%%
-dset_file = data_dir / 'gaborium.dset'
-if dset_file.exists():
-    dset = DictDataset.load(dset_file)
+# Generate or load the Gaborium dataset
+# Gaborium stimuli are complex textures made of many overlapping Gabor patches
+# These provide rich visual input for training neural response models
+gaborium_dataset_file = data_dir / 'gaborium.dset'
+
+if gaborium_dataset_file.exists():
+    print("Loading existing Gaborium dataset...")
+    dataset = DictDataset.load(gaborium_dataset_file)
 else:
-    dset = generate_gaborium_dataset(exp, ks_results, roi_src, 
-                                     dpi_interp, dpi_deg_interp, valid_interp, 
-                                     dt=dt, metadata=metadata)
-    dset.save(dset_file)
+    print("Generating new Gaborium dataset (this may take several minutes)...")
+    dataset = generate_gaborium_dataset(
+        exp, ks_results, analysis_roi,
+        eye_pos_interp, eye_pos_deg_interp, eye_valid_interp,
+        dt=dt, metadata=experiment_metadata
+    )
+    dataset.save(gaborium_dataset_file)
+    print(f"Dataset saved to {gaborium_dataset_file}")
+
+print(f"Dataset contains {len(dataset)} time points")
 
 #%%
+# ============================================================================
+# 5. DATA PREPROCESSING AND QUALITY CONTROL
+# ============================================================================
+# Clean and prepare the data for model training
 
-valid_radius = 10
-n_lags = 20
-    
-# Normalize stimulus
-dset['stim'] = dset['stim'].float()
-dset['stim'] = (dset['stim'] - dset['stim'].mean()) / dset['stim'].std()
+# Define quality control parameters
+MAX_EYE_MOVEMENT = 10  # degrees - exclude data with large eye movements
+N_TIME_LAGS = 20  # number of temporal lags to consider for STA analysis
 
-# Create a binary mask for valid eye positions
-valid_mask = np.logical_and.reduce([
-    np.abs(dset['eyepos'][:,0]) < valid_radius, 
-    np.abs(dset['eyepos'][:,1]) < valid_radius,
-    dset['dpi_valid']
+print("Preprocessing dataset...")
+
+# Normalize stimulus values to have zero mean and unit variance
+# This helps with neural network training stability
+dataset['stim'] = dataset['stim'].float()
+stimulus_mean = dataset['stim'].mean()
+stimulus_std = dataset['stim'].std()
+dataset['stim'] = (dataset['stim'] - stimulus_mean) / stimulus_std
+print(f"Normalized stimulus: mean={stimulus_mean:.3f}, std={stimulus_std:.3f}")
+
+# Create mask for valid data points
+# We exclude time points where:
+# 1. Eye movements are too large (> MAX_EYE_MOVEMENT degrees)
+# 2. Eye tracking was unreliable
+# 3. We don't have enough history for temporal analysis
+print("Creating validity mask...")
+
+valid_eye_positions = np.logical_and.reduce([
+    np.abs(dataset['eyepos'][:, 0]) < MAX_EYE_MOVEMENT,  # Azimuth within bounds
+    np.abs(dataset['eyepos'][:, 1]) < MAX_EYE_MOVEMENT,  # Elevation within bounds
+    dataset['dpi_valid']  # Eye tracking was reliable
 ])
-for iL in range(n_lags):
-    valid_mask &= np.roll(valid_mask, 1, axis=0)
-valid_inds = np.where(valid_mask)[0]
+
+# Ensure we have valid data for all required time lags
+# This prevents using data points that don't have sufficient history
+for lag in range(N_TIME_LAGS):
+    valid_eye_positions &= np.roll(valid_eye_positions, 1, axis=0)
+
+valid_indices = np.where(valid_eye_positions)[0]
+print(f"Valid data points: {len(valid_indices):,} / {len(dataset):,} "
+      f"({100 * len(valid_indices) / len(dataset):.1f}%)")
 #%%
-snr_thresh = 5
-min_num_spikes = 500
+# ============================================================================
+# 6. NEURAL RESPONSE ANALYSIS AND UNIT SELECTION
+# ============================================================================
+# Analyze neural responses to find optimal timing and select high-quality units
+
+# Quality thresholds for unit selection
+SNR_THRESHOLD = 5  # Signal-to-noise ratio threshold
+MIN_SPIKE_COUNT = 500  # Minimum number of spikes required per unit
+
+print("Analyzing neural response timing...")
 
 # Calculate spike-triggered stimulus energy (STE)
-# Determine maximally responsive lag for each cluster
-stes = calc_sta(dset['stim'], dset['robs'], 
-                n_lags, inds=valid_inds, device=device, batch_size=10000,
-                stim_modifier=lambda x: x**2, progress=True).cpu().numpy()
+# STE measures how much stimulus energy drives each neuron at different time lags
+# This helps us find the optimal delay between stimulus and neural response
+spike_triggered_energies = calc_sta(
+    dataset['stim'], dataset['robs'],
+    N_TIME_LAGS, inds=valid_indices, device=device, batch_size=10000,
+    stim_modifier=lambda x: x**2,  # Square stimulus to get energy
+    progress=True
+).cpu().numpy()
 
-# Find maximum energy lag for each cluster
-signal = np.abs(stes - np.median(stes, axis=(2,3), keepdims=True))
-sigma = [0, 2, 2, 2]
-signal = gaussian_filter(signal, sigma)
-noise = np.median(signal[:,0], axis=(1,2))
-snr_per_lag = np.max(signal, axis=(2,3)) / noise[:,None]
-cluster_lag = snr_per_lag.argmax(axis=1)
+print(f"Computed STEs for {spike_triggered_energies.shape[0]} units, "
+      f"{spike_triggered_energies.shape[1]} time lags")
 
-# Shift robs to maximally responsive lag for each cluster 
-n_frames = len(dset['robs'])
-robs = []
-for iC in range(dset['robs'].shape[1]):
-    lag = cluster_lag[iC]
-    max_frame = n_frames + lag - n_lags
-    robs.append(dset['robs'][lag:max_frame,iC])
-robs = torch.stack(robs, axis=1)
+# Find the optimal response lag for each neuron
+# We look for the lag that gives the strongest, most reliable response
+signal_strength = np.abs(spike_triggered_energies -
+                        np.median(spike_triggered_energies, axis=(2,3), keepdims=True))
 
-dset.replicates = True
-dset = dset[:-n_lags]
-dset['robs'] = robs
-dset = dset[valid_mask[:-n_lags]]
-dset.replicates = False
+# Apply spatial smoothing to reduce noise
+smoothing_kernel = [0, 2, 2, 2]  # No temporal smoothing, 2-pixel spatial smoothing
+signal_strength = gaussian_filter(signal_strength, smoothing_kernel)
 
-# Remove bad clusters
-good_ix = np.where(np.max(snr_per_lag, axis=1) > snr_thresh)[0]
-good_ix = np.intersect1d(good_ix, np.where(dset['robs'].sum(0) > min_num_spikes)[0])
-dset['robs'] = dset['robs'][:,good_ix]
-n_units = len(good_ix)
+# Calculate signal-to-noise ratio for each unit and lag
+noise_level = np.median(signal_strength[:, 0], axis=(1,2))  # Use first lag as noise estimate
+signal_to_noise = np.max(signal_strength, axis=(2,3)) / noise_level[:, None]
+optimal_lag_per_unit = signal_to_noise.argmax(axis=1)
 
-# Plot STEs
-fig, axs = plot_stas((stes - np.median(stes, axis=(2,3), keepdims=True))[:,:,None,:,:])
-for iC in good_ix:
-    iL = cluster_lag[iC]
-    x0, x1 = iL, (iL+1)
-    y0, y1 = -iC-1, -iC
-    axs.plot([x0, x1, x1, x0, x0], [y1, y1, y0, y0, y1], 'r-')
+print(f"Optimal response lags range from {optimal_lag_per_unit.min()} to {optimal_lag_per_unit.max()} frames")
+print(f"({optimal_lag_per_unit.min()*dt*1000:.1f} to {optimal_lag_per_unit.max()*dt*1000:.1f} ms)")
+
+# Align neural responses to optimal lag for each unit
+print("Aligning neural responses to optimal lags...")
+n_timepoints = len(dataset['robs'])
+aligned_responses = []
+
+for unit_idx in range(dataset['robs'].shape[1]):
+    lag = optimal_lag_per_unit[unit_idx]
+    # Extract responses starting from the optimal lag
+    max_timepoint = n_timepoints + lag - N_TIME_LAGS
+    unit_responses = dataset['robs'][lag:max_timepoint, unit_idx]
+    aligned_responses.append(unit_responses)
+
+aligned_responses = torch.stack(aligned_responses, axis=1)
+
+# Update dataset with aligned responses
+dataset.replicates = True  # Allow modification of dataset length
+dataset = dataset[:-N_TIME_LAGS]  # Remove timepoints without sufficient history
+dataset['robs'] = aligned_responses
+dataset = dataset[valid_eye_positions[:-N_TIME_LAGS]]  # Apply validity mask
+dataset.replicates = False
+
+# Select high-quality units based on signal-to-noise ratio and spike count
+max_snr_per_unit = np.max(signal_to_noise, axis=1)
+total_spikes_per_unit = dataset['robs'].sum(0)
+
+high_snr_units = np.where(max_snr_per_unit > SNR_THRESHOLD)[0]
+high_activity_units = np.where(total_spikes_per_unit > MIN_SPIKE_COUNT)[0]
+good_units = np.intersect1d(high_snr_units, high_activity_units)
+
+print(f"Unit selection results:")
+print(f"  - Units with SNR > {SNR_THRESHOLD}: {len(high_snr_units)}")
+print(f"  - Units with > {MIN_SPIKE_COUNT} spikes: {len(high_activity_units)}")
+print(f"  - Units passing both criteria: {len(good_units)}")
+
+# Keep only high-quality units
+dataset['robs'] = dataset['robs'][:, good_units]
+n_units = len(good_units)
+
+# Visualize spike-triggered energies with optimal lags highlighted
+print("Plotting spike-triggered energies...")
+normalized_stes = (spike_triggered_energies -
+                  np.median(spike_triggered_energies, axis=(2,3), keepdims=True))
+fig, axs = plot_stas(normalized_stes[:, :, None, :, :])
+
+# Highlight optimal lag for each good unit
+for i, unit_idx in enumerate(good_units):
+    lag = optimal_lag_per_unit[unit_idx]
+    # Draw rectangle around optimal lag
+    x0, x1 = lag, lag + 1
+    y0, y1 = -unit_idx - 1, -unit_idx
+    axs.plot([x0, x1, x1, x0, x0], [y1, y1, y0, y0, y1], 'r-', linewidth=2)
+
+plt.title(f'Spike-Triggered Energies (Red boxes show optimal lags)\n'
+          f'{len(good_units)} units selected from {spike_triggered_energies.shape[0]} total')
 plt.show()
-print(f'Removed {len(good_ix)} bad clusters. {len(dset["robs"][0])} clusters remain.')
+
+print(f"Final dataset: {len(dataset)} timepoints, {n_units} units")
 
 #%%
-for key in dset.keys():
-    if torch.is_tensor(dset[key]):
-        dset[key] = dset[key].to(torch.float32)
+# ============================================================================
+# 7. PREPARE DATA FOR MODEL TRAINING
+# ============================================================================
+# Convert data types and create spatial grid for the shifter model
 
-print(dset)
+print("Preparing data for model training...")
+
+# Ensure all tensor data is in float32 format for consistent computation
+for key in dataset.keys():
+    if torch.is_tensor(dataset[key]):
+        dataset[key] = dataset[key].to(torch.float32)
+
+print("Dataset summary:")
+print(dataset)
+
 #%%
-grid_radius = 25
-# Construct grid centered on peak of spatial STEs
-_, _, n_y, n_x = stes.shape
-weights = (dset['robs'].sum(dim=0) / dset['robs'].sum()).cpu().numpy()
-ste_max = np.zeros((n_y, n_x))
-for i, iC in enumerate(good_ix):
-    lag = cluster_lag[iC]
-    ste_max += stes[iC, lag] * weights[i]
+# ============================================================================
+# CREATE SPATIAL SAMPLING GRID FOR SHIFTER MODEL
+# ============================================================================
+# The shifter model needs a spatial grid to sample from when correcting for eye movements
 
-grid_center = np.array((n_x, n_y)) // 2
-grid = torch.stack(
-            torch.meshgrid(
-                torch.arange(-grid_radius,grid_radius+1), 
-                torch.arange(-grid_radius,grid_radius+1),
-                indexing='xy'
-            ), 
-            dim=-1).float()
-grid += grid_center[None,None,:]
+GRID_RADIUS = 25  # pixels - how far the model can shift the stimulus
 
-x_min, x_max = grid[...,0].min(), grid[...,0].max()
-y_min, y_max = grid[...,1].min(), grid[...,1].max()
+print(f"Creating spatial grid with radius {GRID_RADIUS} pixels...")
 
-fig, axs = plt.subplots(1, 1, figsize=(6, 6))
-im = axs.imshow(ste_max, cmap='viridis')
-fig.colorbar(im, ax=axs)
-axs.plot([x_min, x_min, x_max, x_max, x_min], [y_min, y_max, y_max, y_min, y_min], color='red')
-axs.scatter([grid_center[0]], [grid_center[1]], color='red', marker='x')
-axs.set_title('Population STE')
-axs.set_xlabel('X (pixels)')
-axs.set_ylabel('Y (pixels)')
+# Get dimensions of the stimulus
+_, _, stimulus_height, stimulus_width = spike_triggered_energies.shape
+
+# Calculate population-weighted average of spike-triggered energies
+# This helps us find the center of the population response
+response_weights = (dataset['robs'].sum(dim=0) / dataset['robs'].sum()).cpu().numpy()
+population_ste = np.zeros((stimulus_height, stimulus_width))
+
+for i, unit_idx in enumerate(good_units):
+    optimal_lag = optimal_lag_per_unit[unit_idx]
+    population_ste += spike_triggered_energies[unit_idx, optimal_lag] * response_weights[i]
+
+# Center the grid on the stimulus center
+grid_center = np.array((stimulus_width, stimulus_height)) // 2
+
+# Create coordinate grid for spatial sampling
+# This defines all possible pixel locations the model can sample from
+coordinate_grid = torch.stack(
+    torch.meshgrid(
+        torch.arange(-GRID_RADIUS, GRID_RADIUS + 1),
+        torch.arange(-GRID_RADIUS, GRID_RADIUS + 1),
+        indexing='xy'
+    ),
+    dim=-1
+).float()
+
+# Offset grid to be centered on the stimulus center
+coordinate_grid += grid_center[None, None, :]
+
+# Get grid boundaries for visualization
+x_min, x_max = coordinate_grid[..., 0].min(), coordinate_grid[..., 0].max()
+y_min, y_max = coordinate_grid[..., 1].min(), coordinate_grid[..., 1].max()
+
+# Visualize the population response and sampling grid
+fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+im = ax.imshow(population_ste, cmap='viridis', origin='upper')
+fig.colorbar(im, ax=ax, label='Population STE')
+
+# Draw grid boundaries
+grid_corners_x = [x_min, x_min, x_max, x_max, x_min]
+grid_corners_y = [y_min, y_max, y_max, y_min, y_min]
+ax.plot(grid_corners_x, grid_corners_y, color='red', linewidth=2, label='Sampling grid')
+
+# Mark grid center
+ax.scatter([grid_center[0]], [grid_center[1]], color='red', marker='x',
+          s=100, linewidth=3, label='Grid center')
+
+ax.set_title(f'Population Spike-Triggered Energy\nSampling grid: {2*GRID_RADIUS+1}×{2*GRID_RADIUS+1} pixels')
+ax.set_xlabel('X (pixels)')
+ax.set_ylabel('Y (pixels)')
+ax.legend()
+plt.tight_layout()
 plt.show()
 
-# store meta data
-dset.metadata['valid_radius'] = valid_radius
-dset.metadata['grid_center'] = grid_center
-dset.metadata['snr_thresh'] = snr_thresh
-dset.metadata['min_num_spikes'] = min_num_spikes
-dset.metadata['grid'] = grid
+# Store metadata for model training
+dataset.metadata['max_eye_movement'] = MAX_EYE_MOVEMENT
+dataset.metadata['grid_center'] = grid_center
+dataset.metadata['snr_threshold'] = SNR_THRESHOLD
+dataset.metadata['min_spike_count'] = MIN_SPIKE_COUNT
+dataset.metadata['coordinate_grid'] = coordinate_grid
 
-print(dset)
+print(f"Grid center: [{grid_center[0]}, {grid_center[1]}]")
+print(f"Grid size: {2*GRID_RADIUS+1}×{2*GRID_RADIUS+1} pixels")
+print("Updated dataset metadata")
 
 #%%
+# ============================================================================
+# 8. MODEL ARCHITECTURE DEFINITIONS
+# ============================================================================
+# Define the neural network models for eye movement correction and stimulus processing
 
-# Main class
 class MLPPixelShifter(nn.Module):
-    def __init__(self, grid, 
-                hidden_dims=100,
-                weight_init_multiplier=1, 
-                input_dim=2,
-                anchored=True,
-                mode='bilinear') -> None:
-        
+    """
+    Multi-Layer Perceptron that predicts pixel shifts based on eye position.
+
+    This model learns to map eye positions (in degrees) to pixel shifts that
+    compensate for eye movements. The key insight is that small eye movements
+    can be corrected by shifting the stimulus in the opposite direction.
+
+    Parameters:
+    -----------
+    grid : torch.Tensor
+        Spatial coordinate grid defining possible sampling locations
+    hidden_dims : int or list
+        Number of hidden units in each layer
+    weight_init_multiplier : float
+        Scaling factor for weight initialization
+    input_dim : int
+        Dimensionality of input (2 for [azimuth, elevation])
+    anchored : bool
+        Whether to anchor shifts to zero at the origin
+    mode : str
+        Interpolation mode ('bilinear' or 'nearest')
+    """
+
+    def __init__(self, grid, hidden_dims=100, weight_init_multiplier=1,
+                 input_dim=2, anchored=True, mode='bilinear'):
         super(MLPPixelShifter, self).__init__()
+
         self.input_dim = input_dim
-        self.grid = nn.Parameter(grid.float(), requires_grad=False) # grid is tensor of shape (n_row, n_col, 2)
+        self.grid = nn.Parameter(grid.float(), requires_grad=False)
         self.hidden_dims = hidden_dims
         self.weight_init_multiplier = weight_init_multiplier
+        self.anchored = anchored
         self.set_mode(mode)
 
-        self.anchored = anchored
-
-        # If hidden_dims is a scalar integer, convert it to a list with one element
+        # Convert scalar hidden_dims to list
         if isinstance(hidden_dims, int):
             hidden_dims = [hidden_dims]
 
-        # Dynamically create the layers using hidden_dims list
+        # Build MLP layers
         layers = []
         for i in range(len(hidden_dims)):
             if i == 0:
                 layers.append(nn.Linear(input_dim, hidden_dims[0]))
             else:
                 layers.append(nn.Linear(hidden_dims[i-1], hidden_dims[i], bias=True))
-            layers.append(nn.GELU())
+            layers.append(nn.GELU())  # Smooth activation function
 
+        # Output layer: predict 2D pixel shift
         layers.append(nn.Linear(hidden_dims[-1], 2, bias=True))
-
         self.layers = nn.Sequential(*layers)
 
-        # Initialize weights for all layers
+        # Initialize weights with custom scaling
         for layer in self.layers:
             if isinstance(layer, nn.Linear):
                 layer.weight.data *= weight_init_multiplier
-        
+
     def anchor(self):
-        p0 = self.layers(torch.zeros(self.input_dim, device=self.grid.device))
-        self.layers[-1].bias.data -= p0 # subtract the shift at the origin from the bias
+        """Ensure that zero eye position produces zero shift."""
+        zero_input = torch.zeros(self.input_dim, device=self.grid.device)
+        zero_shift = self.layers(zero_input)
+        self.layers[-1].bias.data -= zero_shift
 
-    def forward(self, x):
-        if self.anchored:
-            self.anchor()
-        x['stim_in'] = x['stim']
-        stim = x['stim']
-        if stim.ndim == 3:
-            stim = stim.unsqueeze(1) # add channel dimension
-
-        n_frames, _,n_y, n_x = stim.shape
-
-        shift = x['eyepos']
-        shift_out = self.layers(shift).squeeze(dim=1)
-        grid_shift = shift_out[:, None, None, :] + self.grid[None, ...]
-        _, n_y_grid, n_x_grid, _ = grid_shift.shape
-
-        frame_grid = torch.arange(n_frames, device=self.grid.device).float() \
-                          .repeat(n_y_grid, n_x_grid, 1) \
-                          .permute(2, 0, 1) \
-                          .unsqueeze(-1)
-
-        sample_grid = torch.cat([grid_shift, frame_grid], dim=-1) # 1 x T x Y x X x 3 (x, y, frame)
-        extent = [
-                [0, n_frames - 1],
-                [0, n_y - 1],
-                [0, n_x - 1]
-        ]
-
-        out = grid_sample_coords(stim.permute(1,0,2,3)[None,...], # 1 x C x T x Y x X  
-                                 sample_grid[None,...], 
-                                 extent, 
-                                 mode=self.mode,
-                                 padding_mode='zeros',
-                                 align_corners=True,
-                                 no_grad=False)
-        out = out.squeeze(dim=(0, 1))
-        x['shift_out'] = shift_out
-        x['stim'] = out
-
-        return x
     def set_mode(self, mode):
+        """Set interpolation mode for spatial sampling."""
         assert mode in ['nearest', 'bilinear'], 'mode must be "nearest" or "bilinear"'
         self.mode = mode
 
-    def plot_shifts(self, x_min, x_max, y_min, y_max, image_resolution=50, quiver_resoluiton=10):
+    def forward(self, x):
+        """
+        Apply eye movement correction to stimulus.
 
+        Parameters:
+        -----------
+        x : dict
+            Dictionary containing 'stim' (stimulus) and 'eyepos' (eye position)
+
+        Returns:
+        --------
+        dict
+            Updated dictionary with corrected stimulus and shift information
+        """
+        if self.anchored:
+            self.anchor()
+
+        # Store original stimulus for comparison
+        x['stim_in'] = x['stim']
+        stimulus = x['stim']
+
+        # Add channel dimension if missing
+        if stimulus.ndim == 3:
+            stimulus = stimulus.unsqueeze(1)
+
+        n_frames, _, n_y, n_x = stimulus.shape
+
+        # Predict pixel shifts from eye positions
+        eye_position = x['eyepos']
+        predicted_shifts = self.layers(eye_position).squeeze(dim=1)
+
+        # Create shifted sampling grid
+        # Add predicted shifts to base coordinate grid
+        shifted_grid = predicted_shifts[:, None, None, :] + self.grid[None, ...]
+        _, n_y_grid, n_x_grid, _ = shifted_grid.shape
+
+        # Create temporal coordinate grid
+        frame_indices = torch.arange(n_frames, device=self.grid.device).float()
+        frame_grid = frame_indices.repeat(n_y_grid, n_x_grid, 1).permute(2, 0, 1).unsqueeze(-1)
+
+        # Combine spatial and temporal coordinates
+        sampling_grid = torch.cat([shifted_grid, frame_grid], dim=-1)
+
+        # Define valid coordinate ranges
+        coordinate_bounds = [
+            [0, n_frames - 1],  # Temporal bounds
+            [0, n_y - 1],       # Vertical bounds
+            [0, n_x - 1]        # Horizontal bounds
+        ]
+
+        # Sample from stimulus using shifted coordinates
+        corrected_stimulus = grid_sample_coords(
+            stimulus.permute(1, 0, 2, 3)[None, ...],  # Reshape to [1, C, T, Y, X]
+            sampling_grid[None, ...],
+            coordinate_bounds,
+            mode=self.mode,
+            padding_mode='zeros',
+            align_corners=True,
+            no_grad=False
+        )
+
+        corrected_stimulus = corrected_stimulus.squeeze(dim=(0, 1))
+
+        # Update dictionary with results
+        x['shift_out'] = predicted_shifts
+        x['stim'] = corrected_stimulus
+
+        return x
+
+    def plot_shifts(self, x_min, x_max, y_min, y_max, v_max=None,
+                   image_resolution=50, quiver_resolution=10):
+        """
+        Visualize the learned shift function.
+
+        Creates a heatmap showing shift magnitude and arrows showing shift direction
+        across the range of possible eye positions.
+        """
         with torch.no_grad():
-            x_im = torch.linspace(x_min, x_max, image_resolution, device=self.grid.device)
-            y_im = torch.linspace(y_min, y_max, image_resolution, device=self.grid.device)
-            xy_im = torch.stack(
-                torch.meshgrid(x_im, y_im, indexing='xy'),
-                dim=-1)
-                
-            x_qv = torch.linspace(x_min, x_max, quiver_resoluiton, device=self.grid.device)
-            y_qv = torch.linspace(y_min, y_max, quiver_resoluiton, device=self.grid.device)
-            xy_qv = torch.stack(
-                torch.meshgrid(x_qv, y_qv, indexing='xy'),
-                dim=-1)
+            # Create high-resolution grid for smooth heatmap
+            x_hires = torch.linspace(x_min, x_max, image_resolution, device=self.grid.device)
+            y_hires = torch.linspace(y_min, y_max, image_resolution, device=self.grid.device)
+            xy_hires = torch.stack(torch.meshgrid(x_hires, y_hires, indexing='xy'), dim=-1)
 
-            shift_im = self.layers(xy_im).norm(dim=-1)
-            shift_qv = self.layers(xy_qv)        
-        fig, axs = plt.subplots(1,1, figsize=(6, 6))
-        im = axs.imshow(shift_im.cpu(), extent=[x_min, x_max, y_min, y_max], origin='lower')
-        fig.colorbar(im, ax=axs)
-        axs.quiver(xy_qv[...,0].cpu(),
-                   xy_qv[...,1].cpu(), 
-                   shift_qv[...,1].cpu(), 
-                   -shift_qv[...,0].cpu(), 
-                   color='red')
-        return fig, axs
+            # Create lower-resolution grid for arrow visualization
+            x_arrows = torch.linspace(x_min, x_max, quiver_resolution, device=self.grid.device)
+            y_arrows = torch.linspace(y_min, y_max, quiver_resolution, device=self.grid.device)
+            xy_arrows = torch.stack(torch.meshgrid(x_arrows, y_arrows, indexing='xy'), dim=-1)
 
-# CNN model
+            # Compute shifts
+            shift_magnitude = self.layers(xy_hires).norm(dim=-1)
+            shift_vectors = self.layers(xy_arrows)
+
+        # Create visualization
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+        # Heatmap of shift magnitude
+        im = ax.imshow(shift_magnitude.cpu(), extent=[x_min, x_max, y_min, y_max],
+                      vmin=0, vmax=v_max,
+                      origin='lower', cmap='viridis')
+        fig.colorbar(im, ax=ax, label='Shift magnitude (pixels)')
+
+        # Arrow plot showing shift direction
+        ax.quiver(xy_arrows[..., 0].cpu(), xy_arrows[..., 1].cpu(),
+                 shift_vectors[..., 1].cpu(), -shift_vectors[..., 0].cpu(),
+                 color='red', alpha=0.7)
+
+        ax.set_xlabel('Eye position X (degrees)')
+        ax.set_ylabel('Eye position Y (degrees)')
+        ax.set_title('Learned Eye Movement Correction Function')
+
+        return fig, ax
+
 class StimulusCNN(nn.Module):
-    def __init__(self, dims, kernel_sizes,
-                channels,
-                n_units, strides=None,
-                normalize_spatial_weights=False,
-                fr_init = None,
-                 ) -> None:
+    """
+    Convolutional Neural Network for processing visual stimuli and predicting neural responses.
+
+    This CNN takes the (potentially shifted) stimulus and predicts the firing rate
+    of each neuron. It uses a cascade of convolutional layers followed by a
+    nonparametric readout that maps features to individual neurons.
+
+    Parameters:
+    -----------
+    dims : tuple
+        Input dimensions (channels, height, width)
+    kernel_sizes : int or list
+        Convolutional kernel sizes for each layer
+    channels : int or list
+        Number of output channels for each convolutional layer
+    n_units : int
+        Number of neurons to predict
+    strides : list, optional
+        Stride for each convolutional layer
+    normalize_spatial_weights : bool
+        Whether to normalize spatial readout weights
+    fr_init : array-like, optional
+        Initial firing rates for bias initialization
+    """
+
+    def __init__(self, dims, kernel_sizes, channels, n_units, strides=None,
+                 normalize_spatial_weights=False, fr_init=None):
         super(StimulusCNN, self).__init__()
-        
+
         self.dims = dims
         self.normalize_spatial_weights = normalize_spatial_weights
 
+        # Convert scalars to lists for consistency
         if isinstance(kernel_sizes, int):
             kernel_sizes = [kernel_sizes]
         if isinstance(channels, int):
             channels = [channels]
-        assert len(kernel_sizes) == len(channels), 'kernel_sizes and channels must have the same length'
+
+        # Validate input dimensions
+        assert len(kernel_sizes) == len(channels), \
+            'kernel_sizes and channels must have the same length'
+
         if strides is None:
             strides = [1] * len(kernel_sizes)
-        assert len(strides) == len(kernel_sizes), 'strides must have the same length as kernel_sizes'
-        
+        assert len(strides) == len(kernel_sizes), \
+            'strides must have the same length as kernel_sizes'
+
+        # Build convolutional layers
         n_layers = len(kernel_sizes)
         layers = []
+
         for i in range(n_layers):
+            # Input channels: original dims for first layer, doubled for subsequent layers (due to SplitRelu)
             in_channels = dims[0] if i == 0 else channels[i-1] * 2
             out_channels = channels[i]
-            layers.append(StackedConv2d(in_channels, out_channels, kernel_sizes[i], stride=strides[i], bias=False))
+
+            # Add convolutional layer with batch normalization and split ReLU
+            layers.append(StackedConv2d(in_channels, out_channels, kernel_sizes[i],
+                                      stride=strides[i], bias=False))
             layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(SplitRelu())
+            layers.append(SplitRelu())  # Doubles the number of channels
 
-        # Calculate the output dimensions taking into account kernel sizes, strides, and pooling
-        h, w = dims[1], dims[2]
+        # Calculate output spatial dimensions after convolutions
+        height, width = dims[1], dims[2]
         for i in range(n_layers):
-            h = (h - kernel_sizes[i]) // strides[i] + 1
-            w = (w - kernel_sizes[i]) // strides[i] + 1
+            height = (height - kernel_sizes[i]) // strides[i] + 1
+            width = (width - kernel_sizes[i]) // strides[i] + 1
 
-        dims_out = [channels[-1]*2, h, w]
-        readout = NonparametricReadout(dims_out, n_units)
-            
+        # Final feature dimensions (channels doubled by SplitRelu)
+        feature_dims = [channels[-1] * 2, height, width]
+
+        # Add readout layer that maps features to individual neurons
+        readout = NonparametricReadout(feature_dims, n_units)
         layers.append(readout)
+
+        # Add softplus activation to ensure positive firing rates
         layers.append(nn.Softplus())
 
         self.layers = nn.Sequential(*layers)
 
-        inv_softplus = lambda x, beta=1: torch.log(torch.exp(beta*x) - 1) / beta
+        # Initialize readout biases based on observed firing rates
         if fr_init is not None:
-            assert len(fr_init) == n_units, 'init_rates must have the same length as n_units'
+            assert len(fr_init) == n_units, 'fr_init must have the same length as n_units'
+            # Use inverse softplus to set appropriate bias values
+            inv_softplus = lambda x, beta=1: torch.log(torch.exp(beta * x) - 1) / beta
             self.layers[-2].bias.data = inv_softplus(
                 ensure_tensor(fr_init, device=self.layers[-2].bias.device)
             )
 
-
     def forward(self, x):
-        # normalize spatial weights
+        """
+        Process stimulus and predict neural responses.
+
+        Parameters:
+        -----------
+        x : dict
+            Dictionary containing 'stim' (stimulus tensor)
+
+        Returns:
+        --------
+        dict
+            Updated dictionary with 'rhat' (predicted firing rates)
+        """
+        # Normalize spatial weights if requested
         for layer in self.layers:
             if hasattr(layer, 'normalize_spatial_weights'):
                 layer.normalize_spatial_weights()
 
-        stim = x['stim'].float()
-        if stim.ndim == 3:  # missing channel dimension
-            stim = stim.unsqueeze(1) 
-        x['rhat'] = self.layers(stim).squeeze()
+        stimulus = x['stim'].float()
+
+        # Add channel dimension if missing
+        if stimulus.ndim == 3:
+            stimulus = stimulus.unsqueeze(1)
+
+        # Predict firing rates
+        predicted_rates = self.layers(stimulus).squeeze()
+        x['rhat'] = predicted_rates
+
         return x
+
 
 class ShifterModel(nn.Module):
-    def __init__(self, shifter_hparams, cnn_hparams):
+    """
+    Complete model combining eye movement correction and neural response prediction.
+
+    This model first applies the shifter to correct for eye movements, then
+    uses the CNN to predict neural responses from the corrected stimulus.
+    """
+
+    def __init__(self, shifter_params, cnn_params):
         super(ShifterModel, self).__init__()
-        self.shifter = MLPPixelShifter(**shifter_hparams)
-        self.cnn = StimulusCNN(**cnn_hparams)
-    
+        self.shifter = MLPPixelShifter(**shifter_params)
+        self.cnn = StimulusCNN(**cnn_params)
+
     def forward(self, x):
-        x = self.shifter(x)
-        x = self.cnn(x)
+        """Apply eye movement correction followed by neural response prediction."""
+        x = self.shifter(x)  # Correct for eye movements
+        x = self.cnn(x)      # Predict neural responses
         return x
 
 #%%
+# ============================================================================
+# 9. MODEL TRAINING SETUP
+# ============================================================================
+# Configure data loaders, model parameters, and training procedures
 
-# Data loaders
-loader_hparams = {
-    'batch_size': 128,
-    'num_workers': os.cpu_count(),
-    'pin_memory': True,
+print("Setting up model training...")
+
+# Data loading configuration
+BATCH_SIZE = 128
+# Move dataset to device
+dataset = dataset.to(device)
+
+# Split dataset into training and validation sets
+train_dataset, validation_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = torch.utils.data.DataLoader(validation_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+print(f"Training set: {len(train_dataset):,} samples")
+print(f"Validation set: {len(validation_dataset):,} samples")
+print(f"Batch size: {BATCH_SIZE}")
+
+# Shifter model parameters
+shifter_config = {
+    'grid': dataset.metadata['coordinate_grid'],
+    'weight_init_multiplier': 1.0,  # Standard weight initialization
+    'hidden_dims': [400],  # Single hidden layer with 400 units
+    'anchored': True,  # Ensure zero eye position gives zero shift
+    'mode': 'bilinear'  # Smooth interpolation
 }
 
-train_set, val_set = torch.utils.data.random_split(dset, [.8, .2])
-train_loader = torch.utils.data.DataLoader(train_set, **loader_hparams, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_set, **loader_hparams, shuffle=False)
-
-# shifter params
-shifter_kwargs = {
-    'grid': dset.metadata['grid'],
-    'weight_init_multiplier': 1,
-    'hidden_dims': [400],
-}
-# CNN params
-cnn_kwargs = {
-    'dims': (1, dset.metadata['grid'].shape[0], dset.metadata['grid'].shape[1]),
-    'kernel_sizes': [21, 11],
-    'channels': [16, 16],
+# CNN model parameters
+cnn_config = {
+    'dims': (1, dataset.metadata['coordinate_grid'].shape[0],
+             dataset.metadata['coordinate_grid'].shape[1]),
+    'kernel_sizes': [21, 11],  # Large then smaller receptive fields
+    'channels': [16, 16],  # Number of feature maps per layer
     'n_units': n_units,
     'normalize_spatial_weights': False,
-    'fr_init': train_set[:]['robs'].mean(dim=0),
+    'fr_init': train_dataset[:]['robs'].mean(dim=0),  # Initialize with observed rates
 }
 
-# %%
+print(f"Shifter grid size: {dataset.metadata['coordinate_grid'].shape}")
+print(f"CNN input dimensions: {cnn_config['dims']}")
+print(f"Predicting responses for {n_units} neurons")
 
-optimizer_hparams = {
-    'lr': 1e-3,
-    'weight_decay': 1e-3,
-    'betas': (0.9, 0.999),
+#%%
+# ============================================================================
+# 10. MODEL TRAINING AND OPTIMIZATION
+# ============================================================================
+# Train the shifter model to learn eye movement corrections
+
+# Optimizer configuration
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-3  # L2 regularization
+N_EPOCHS = 1  # Number of training epochs (increase for better performance)
+
+optimizer_config = {
+    'lr': LEARNING_RATE,
+    'weight_decay': WEIGHT_DECAY,
+    'betas': (0.9, 0.999),  # Adam momentum parameters
 }
-model = ShifterModel(shifter_kwargs, cnn_kwargs)
-optimizer = torch.optim.AdamW(model.parameters(), **optimizer_hparams)
 
-val_bps_aggregator = PoissonBPSAggregator()
-n_epochs = 1
+# Initialize model and optimizer
+print("Initializing model...")
+model = ShifterModel(shifter_config, cnn_config)
+optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
 
-def train_epoch():
-    for batch in (pbar := tqdm(train_loader, f'Epoch {epoch}')):
+# Move model to GPU if available
+model = model.to(device)
+print(f"Model moved to {device}")
+
+# Validation metric aggregator
+validation_aggregator = PoissonBPSAggregator()
+
+def train_epoch(epoch_num):
+    """Train the model for one epoch."""
+    model.train()
+    total_loss = 0
+    n_batches = 0
+
+    progress_bar = tqdm(train_loader, desc=f'Epoch {epoch_num}')
+    for batch in progress_bar:
+        # Move batch to device
+        for key in batch:
+            if torch.is_tensor(batch[key]):
+                batch[key] = batch[key].to(device)
+
+        # Forward pass
         optimizer.zero_grad()
         output = model(batch)
-        loss = F.poisson_nll_loss(output['rhat'], batch['robs'], log_input=False, full=False)
+
+        # Compute Poisson negative log-likelihood loss
+        loss = F.poisson_nll_loss(output['rhat'], batch['robs'],
+                                 log_input=False, full=False)
+
+        # Backward pass
         loss.backward()
         optimizer.step()
-        #scheduler.step(loss, epoch)
-        pbar.set_postfix({'loss': loss.item()})
+
+        # Track metrics
+        total_loss += loss.item()
+        n_batches += 1
+        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+    avg_loss = total_loss / n_batches
+    print(f'Epoch {epoch_num} - Average training loss: {avg_loss:.4f}')
+    return avg_loss
 
 def validate():
+    """Evaluate model on validation set."""
+    model.eval()
+    validation_aggregator.reset()
+
     with torch.no_grad():
-        for batch in tqdm(val_loader, f'Validation'):
+        for batch in tqdm(val_loader, desc='Validation'):
+            # Move batch to device
+            for key in batch:
+                if torch.is_tensor(batch[key]):
+                    batch[key] = batch[key].to(device)
+
+            # Forward pass
             output = model(batch)
-            val_bps_aggregator(output)
-        val_bps = val_bps_aggregator.closure().mean().item()
-        print(f'Validation BPS: {val_bps}')
-        val_bps_aggregator.reset()
-        return val_bps
+            validation_aggregator(output)
 
-fig, axs = model.shifter.plot_shifts(-dset.metadata['valid_radius'], dset.metadata['valid_radius'], -dset.metadata['valid_radius'], dset.metadata['valid_radius'])
-axs.set_title('Shifter Initialization')
-axs.set_xlabel('X (deg)')
-axs.set_ylabel('Y (deg)')
-axs.images[0].colorbar.set_label('Shift (pixel)')
+    # Compute bits per spike (higher is better)
+    val_bps = validation_aggregator.closure().mean().item()
+    print(f'Validation BPS: {val_bps:.4f}')
+    return val_bps
+
+# Visualize initial shifter function
+print("Visualizing initial shifter function...")
+fig, ax = model.shifter.plot_shifts(-MAX_EYE_MOVEMENT, MAX_EYE_MOVEMENT,
+                                   -MAX_EYE_MOVEMENT, MAX_EYE_MOVEMENT, v_max=30)
+ax.set_title('Shifter Function at Initialization')
+ax.set_xlabel('Eye position X (degrees)')
+ax.set_ylabel('Eye position Y (degrees)')
+plt.tight_layout()
 plt.show()
-    
-validate()
-for epoch in range(n_epochs):
-    train_epoch()
-    validate()
 
-fig, axs = model.shifter.plot_shifts(-dset.metadata['valid_radius'], dset.metadata['valid_radius'], -dset.metadata['valid_radius'], dset.metadata['valid_radius'])
-axs.set_title('Final shifts')
-axs.set_xlabel('X (deg)')
-axs.set_ylabel('Y (deg)')
-axs.images[0].colorbar.set_label('Shift (pixel)')
+# Initial validation
+print("Initial model performance:")
+initial_bps = validate()
+
+# Training loop
+print(f"\nStarting training for {N_EPOCHS} epochs...")
+for epoch in range(N_EPOCHS):
+    train_loss = train_epoch(epoch + 1)
+    val_bps = validate()
+    print(f"Epoch {epoch + 1} complete - Loss: {train_loss:.4f}, BPS: {val_bps:.4f}\n")
+
+# Visualize final shifter function
+print("Visualizing learned shifter function...")
+fig, ax = model.shifter.plot_shifts(-MAX_EYE_MOVEMENT, MAX_EYE_MOVEMENT,
+                                   -MAX_EYE_MOVEMENT, MAX_EYE_MOVEMENT, v_max=30)
+ax.set_title('Learned Shifter Function After Training')
+ax.set_xlabel('Eye position X (degrees)')
+ax.set_ylabel('Eye position Y (degrees)')
+plt.tight_layout()
 plt.show()
-# %%
-# Get and display stas pre and post shifting
 
-i_slc = slice(grid_center[0] - grid_radius, grid_center[0] + grid_radius + 1)
-j_slc = slice(grid_center[1] - grid_radius, grid_center[1] + grid_radius + 1)
-pre_stas = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device=device, progress=True).detach().cpu().numpy().squeeze()
-pre_stes = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device=device, stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
+print("Training complete!")
+#%%
+# ============================================================================
+# 11. EVALUATE SHIFTER MODEL PERFORMANCE
+# ============================================================================
+# Compare neural responses before and after eye movement correction
 
+print("Evaluating shifter model performance...")
+print("Computing spike-triggered averages before and after correction...")
+
+# Define region for STA analysis (centered on the sampling grid)
+sta_slice_i = slice(grid_center[0] - GRID_RADIUS, grid_center[0] + GRID_RADIUS + 1)
+sta_slice_j = slice(grid_center[1] - GRID_RADIUS, grid_center[1] + GRID_RADIUS + 1)
+
+# Compute spike-triggered averages (STAs) for original stimulus
+print("Computing STAs for original stimulus...")
+original_stas = calc_sta(
+    dataset['stim'][:, sta_slice_i, sta_slice_j],
+    dataset['robs'],
+    [0],  # Zero lag (instantaneous)
+    batch_size=2048,
+    device=device,
+    progress=True
+).detach().cpu().numpy().squeeze()
+
+# Compute spike-triggered energies (STEs) for original stimulus
+print("Computing STEs for original stimulus...")
+original_stes = calc_sta(
+    dataset['stim'][:, sta_slice_i, sta_slice_j],
+    dataset['robs'],
+    [0],
+    batch_size=2048,
+    device=device,
+    stim_modifier=lambda x: x**2,  # Square stimulus to get energy
+    progress=True
+).detach().cpu().numpy().squeeze()
+
+# Apply shifter model to correct for eye movements
+print("Applying shifter model to dataset...")
 with torch.no_grad():
-    shifted_dset = model.shifter(dset[:])
-shifted_stas = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device=device, progress=True).detach().cpu().numpy().squeeze()
-shifted_stes = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device=device, stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
+    model.eval()
+    # Process entire dataset through shifter
+    corrected_data = model.shifter(dataset[:])
+
+# Compute STAs and STEs for corrected stimulus
+print("Computing STAs for corrected stimulus...")
+corrected_stas = calc_sta(
+    corrected_data['stim'],
+    dataset['robs'],
+    [0],
+    batch_size=2048,
+    device=device,
+    progress=True
+).detach().cpu().numpy().squeeze()
+
+print("Computing STEs for corrected stimulus...")
+corrected_stes = calc_sta(
+    corrected_data['stim'],
+    dataset['robs'],
+    [0],
+    batch_size=2048,
+    device=device,
+    stim_modifier=lambda x: x**2,
+    progress=True
+).detach().cpu().numpy().squeeze()
 
 #%%
-stas = np.stack([pre_stas, shifted_stas], axis=1)
-stas /= np.max(np.abs(stas), axis=(1,2,3), keepdims=True)
-stes = np.stack([pre_stes, shifted_stes], axis=1)
-stes -= np.median(stes, axis=(2,3), keepdims=True)
-stes /= np.max(np.abs(stes), axis=(1,2,3), keepdims=True)
+# ============================================================================
+# NORMALIZE DATA FOR COMPARISON
+# ============================================================================
+# Prepare STAs and STEs for visualization by normalizing their ranges
+
+print("Normalizing data for visualization...")
+
+# Stack original and corrected STAs for comparison
+# Shape: (n_units, 2, height, width) where 2 = [original, corrected]
+comparison_stas = np.stack([original_stas, corrected_stas], axis=1)
+
+# Normalize STAs to [-1, 1] range for each unit
+# This makes it easier to compare the shape and structure of receptive fields
+comparison_stas = comparison_stas / np.max(np.abs(comparison_stas), axis=(1,2,3), keepdims=True)
+
+# Stack and normalize STEs similarly
+comparison_stes = np.stack([original_stes, corrected_stes], axis=1)
+
+# Remove median and normalize STEs
+# STEs show energy patterns, so we remove the baseline and normalize
+comparison_stes = comparison_stes - np.median(comparison_stes, axis=(2,3), keepdims=True)
+comparison_stes = comparison_stes / np.max(np.abs(comparison_stes), axis=(1,2,3), keepdims=True)
+
+print(f"Prepared comparison data for {comparison_stas.shape[0]} units")
+print(f"STA dimensions: {comparison_stas.shape}")
+print(f"STE dimensions: {comparison_stes.shape}")
 
 #%%
-n_cols = 5
-n_rows = np.ceil(n_units / n_cols).astype(int)
-fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols*2, n_rows*2))
-for iU in range(n_units):
-    ax = axs.flatten()[iU]
-    ax.set_title(f'Unit {good_ix[iU]}')
-    ax.imshow(stas[iU,0], cmap='coolwarm', vmin=-1, vmax=1, 
-                extent=[0, 1, 0, 1])
-    ax.imshow(stes[iU,0], cmap='coolwarm', vmin=-1, vmax=1, 
-                extent=[1, 2, 0, 1])
-    ax.imshow(stas[iU,1], cmap='coolwarm', vmin=-1, vmax=1, 
-                extent=[0, 1, 1, 2])
-    ax.imshow(stes[iU,1], cmap='coolwarm', vmin=-1, vmax=1, 
-                extent=[1, 2, 1, 2])
-    ax.plot([0, 2], [1, 1], 'k-', linewidth=1)
-    ax.plot([1, 1], [0, 2], 'k-', linewidth=1)
+# ============================================================================
+# VISUALIZE BEFORE/AFTER COMPARISON
+# ============================================================================
+# Create comprehensive visualization showing the effect of eye movement correction
+
+print("Creating before/after comparison visualization...")
+
+# Layout parameters for the visualization grid
+N_COLS = 5  # Number of columns in the subplot grid
+N_ROWS = int(np.ceil(n_units / N_COLS))  # Calculate required rows
+
+# Create figure with subplots for each unit
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(N_COLS*2, N_ROWS*2))
+axes = axes.flatten() if n_units > 1 else [axes]
+
+# Plot comparison for each unit
+for unit_idx in range(n_units):
+    ax = axes[unit_idx]
+
+    # Create 2x2 grid within each subplot:
+    # Top row: Original data (STA left, STE right)
+    # Bottom row: Corrected data (STA left, STE right)
+
+    # Original STA (top-left quadrant)
+    ax.imshow(comparison_stas[unit_idx, 0], cmap='coolwarm', vmin=-1, vmax=1,
+              extent=[0, 1, 1, 2])
+
+    # Original STE (top-right quadrant)
+    ax.imshow(comparison_stes[unit_idx, 0], cmap='coolwarm', vmin=-1, vmax=1,
+              extent=[1, 2, 1, 2])
+
+    # Corrected STA (bottom-left quadrant)
+    ax.imshow(comparison_stas[unit_idx, 1], cmap='coolwarm', vmin=-1, vmax=1,
+              extent=[0, 1, 0, 1])
+
+    # Corrected STE (bottom-right quadrant)
+    ax.imshow(comparison_stes[unit_idx, 1], cmap='coolwarm', vmin=-1, vmax=1,
+              extent=[1, 2, 0, 1])
+
+    # Add grid lines to separate quadrants
+    ax.plot([0, 2], [1, 1], 'k-', linewidth=1)  # Horizontal divider
+    ax.plot([1, 1], [0, 2], 'k-', linewidth=1)  # Vertical divider
+
+    # Set axis properties
     ax.set_xlim([0, 2])
-    ax.set_ylim([2, 0])
-    ax.set_xticks([0.5, 1.5], ['STA', 'STE'])
-    ax.set_yticks([0.5, 1.5], ['Pre', 'Post'])
-    
-for ax in axs.flatten()[n_units:]:
-    ax.axis('off')
+    ax.set_ylim([0, 2])  # Invert y-axis for image display
+    ax.set_xticks([0.5, 1.5])
+    ax.set_xticklabels(['STA', 'STE'])
+    ax.set_yticks([0.5, 1.5])
+    ax.set_yticklabels(['Shift', 'Raw'], rotation=45)
+    ax.set_title(f'Unit {good_units[unit_idx]}', fontsize=10)
 
-# reduce the distance between subplots
-fig.subplots_adjust(hspace=0.01, wspace=0.03)
-# add colorbar
-fig.tight_layout()
+# Hide unused subplots
+for unit_idx in range(n_units, len(axes)):
+    axes[unit_idx].axis('off')
+
+# Adjust layout for better appearance
+fig.suptitle('Receptive Fields Before and After Eye Movement Correction\n'
+             'STA = Spike-Triggered Average, STE = Spike-Triggered Energy',
+             fontsize=14, y=0.98)
+fig.subplots_adjust(hspace=0.1, wspace=0.5, top=0.92)
 plt.show()
+
+# Print summary statistics
+print(f"\nComparison Summary:")
+print(f"- Analyzed {n_units} high-quality units")
+print(f"- Grid size: {2*GRID_RADIUS+1}×{2*GRID_RADIUS+1} pixels")
+print(f"- Each unit shows STA and STE before and after correction")
+print(f"- Look for sharper, more focused receptive fields after correction")
 #%%
+# ============================================================================
+# 12. GRATINGS ANALYSIS - PHASE TUNING EVALUATION
+# ============================================================================
+# Test the shifter model using drifting gratings to measure phase tuning improvements
 
-# gratings index
+print("Setting up gratings analysis...")
+print("This analysis tests whether eye movement correction improves phase tuning precision")
 
-#%%
+# Apply learned shifter function to the original eye position data
+print("Applying learned shifter to eye position data...")
+with torch.no_grad():
+    model.eval()
+    model.to('cpu')
+    # Convert eye positions to tensor and apply shifter
+    eye_positions_tensor = torch.from_numpy(eye_positions_degrees).float()
+    predicted_pixel_shifts = model.shifter.layers(eye_positions_tensor).squeeze().numpy()
 
-with torch.no_grad(): 
-    dpi_shifts = model.shifter.layers(torch.from_numpy(dpi_deg).float()).squeeze().numpy()
-dpi_pix_shifted = dpi_pix + np.fliplr(dpi_shifts)
-dpi_shifted_interp = interp1d(t_ephys, dpi_pix_shifted, kind='linear', fill_value='extrapolate', axis=0)
+# Create corrected eye position data by adding predicted shifts
+# Note: We flip the shifts because eye movements and stimulus shifts are opposite
+corrected_eye_positions_pixels = eye_positions_pixels + np.fliplr(predicted_pixel_shifts)
 
-roi_gratings = np.stack([rf_pix, rf_pix + 1], axis=1)
+# Create interpolation function for corrected eye positions
+corrected_eye_interp = interp1d(eye_times, corrected_eye_positions_pixels,
+                               kind='linear', fill_value='extrapolate', axis=0)
 
-gratings_dset_file = data_dir / 'gratings.dset'
-if gratings_dset_file.exists():
-    gratings_dset = DictDataset.load(gratings_dset_file)
+# Define ROI for gratings analysis (small region around RF center)
+gratings_roi = np.stack([rf_center_pixels, rf_center_pixels + 1], axis=1)
+
+# Generate or load gratings dataset
+gratings_dataset_file = data_dir / 'gratings.dset'
+
+if gratings_dataset_file.exists():
+    print("Loading existing gratings dataset...")
+    gratings_dataset = DictDataset.load(gratings_dataset_file)
 else:
-    gratings_dset = generate_gratings_dataset(exp, ks_results, roi_gratings, 
-                                              dpi_interp, dpi_deg_interp, valid_interp, dt=dt, metadata=metadata)
-    gratings_shifted_dset = generate_gratings_dataset(exp, ks_results, roi_gratings, 
-                                                      dpi_shifted_interp, dpi_deg_interp, valid_interp, dt=dt, metadata=metadata)
-    gratings_dset['stim_shifted'] = gratings_shifted_dset['stim']
-    gratings_dset['stim_phase_shifted'] = gratings_shifted_dset['stim_phase']
-    gratings_dset.save(gratings_dset_file)
+    print("Generating gratings datasets (original and corrected)...")
+
+    # Generate dataset with original eye positions
+    gratings_dataset = generate_gratings_dataset(
+        exp, ks_results, gratings_roi,
+        eye_pos_interp, eye_pos_deg_interp, eye_valid_interp,
+        dt=dt, metadata=experiment_metadata
+    )
+
+    # Generate dataset with corrected eye positions
+    gratings_corrected_dataset = generate_gratings_dataset(
+        exp, ks_results, gratings_roi,
+        corrected_eye_interp, eye_pos_deg_interp, eye_valid_interp,
+        dt=dt, metadata=experiment_metadata
+    )
+
+    # Add corrected data to main dataset
+    gratings_dataset['stim_shifted'] = gratings_corrected_dataset['stim']
+    gratings_dataset['stim_phase_shifted'] = gratings_corrected_dataset['stim_phase']
+
+    # Save for future use
+    gratings_dataset.save(gratings_dataset_file)
+    print(f"Gratings dataset saved to {gratings_dataset_file}")
+
+print(f"Gratings dataset contains {len(gratings_dataset)} timepoints")
 
 #%%
+# ============================================================================
+# PREPARE GRATINGS DATA FOR ANALYSIS
+# ============================================================================
+# Filter gratings data and analyze spatial frequency and orientation tuning
 
-dfs = np.logical_and.reduce([
-    np.abs(gratings_dset['eyepos'][:,0]) < valid_radius,
-    np.abs(gratings_dset['eyepos'][:,1]) < valid_radius,
-    gratings_dset['dpi_valid']
+print("Preparing gratings data for phase tuning analysis...")
+
+# Create validity filter for gratings data (same criteria as main dataset)
+gratings_validity_filter = np.logical_and.reduce([
+    np.abs(gratings_dataset['eyepos'][:, 0]) < MAX_EYE_MOVEMENT,
+    np.abs(gratings_dataset['eyepos'][:, 1]) < MAX_EYE_MOVEMENT,
+    gratings_dataset['dpi_valid']
 ]).astype(np.float32)
-gratings_dset['dfs'] = dfs
+
+# Add validity filter to dataset
+gratings_dataset['validity_filter'] = gratings_validity_filter
+
+print(f"Valid gratings timepoints: {gratings_validity_filter.sum():,.0f} / {len(gratings_validity_filter):,}")
 
 #%%
+# ============================================================================
+# ANALYZE SPATIAL FREQUENCY AND ORIENTATION TUNING
+# ============================================================================
+# Find optimal stimulus parameters for each neuron using gratings data
+
 from utils.general import fit_sine
 
-robs = gratings_dset['robs'].numpy()
+print("Analyzing spatial frequency and orientation tuning...")
 
-sf = gratings_dset['sf'].numpy()
-sfs = np.unique(sf)
-ori = gratings_dset['ori'].numpy()
-oris = np.unique(ori)
-# one-hot embed sfs and oris
-sf_ori_one_hot = np.zeros((len(robs), len(sfs), len(oris)))
-for i in range(len(robs)):
-    sf_idx = np.where(sfs == sf[i])[0][0]
-    ori_idx = np.where(oris == ori[i])[0][0]
-    sf_ori_one_hot[i, sf_idx, ori_idx] = 1
+# Extract neural responses and stimulus parameters
+neural_responses = gratings_dataset['robs'].numpy()
+spatial_frequencies = gratings_dataset['sf'].numpy()
+orientations = gratings_dataset['ori'].numpy()
 
-sf_ori_sta = calc_sta(sf_ori_one_hot, robs.astype(np.float64), 
-                        n_lags, 
-                        reverse_correlate=False, progress=True).numpy() / dt
+# Get unique stimulus parameter values
+unique_spatial_frequencies = np.unique(spatial_frequencies)
+unique_orientations = np.unique(orientations)
 
-sf_sta = calc_sta(sf_ori_one_hot.sum(2, keepdims=True), robs.astype(np.float64), 
-                    n_lags, reverse_correlate=False, progress=True).numpy().squeeze() / dt
+print(f"Spatial frequencies tested: {len(unique_spatial_frequencies)} values")
+print(f"Orientations tested: {len(unique_orientations)} values")
 
+# Create one-hot encoding for spatial frequency and orientation combinations
+# This creates a 3D array: [time, spatial_frequency, orientation]
+sf_ori_encoding = np.zeros((len(neural_responses), len(unique_spatial_frequencies), len(unique_orientations)))
 
-temporal_tuning = np.linalg.norm(sf_sta, axis=2)
-peak_lags = np.argmax(temporal_tuning, axis=1)
-sf_tuning = np.linalg.norm(sf_sta[:,peak_lags], axis=1)
-peak_sf = np.argmax(sf_tuning, axis=1)
-sf_snr = sf_tuning[np.arange(len(sf_tuning)), peak_sf] / np.mean(sf_tuning, axis=1)
-ori_tuning = sf_ori_sta[np.arange(len(sf_ori_sta)), peak_lags, peak_sf]
-peak_ori = np.argmax(ori_tuning, axis=1)
-ori_snr = ori_tuning[np.arange(len(ori_tuning)), peak_ori] / np.mean(ori_tuning, axis=1)
+for timepoint in range(len(neural_responses)):
+    sf_index = np.where(unique_spatial_frequencies == spatial_frequencies[timepoint])[0][0]
+    ori_index = np.where(unique_orientations == orientations[timepoint])[0][0]
+    sf_ori_encoding[timepoint, sf_index, ori_index] = 1
 
-phases = []
-spikes = []
-shifted_phases = []
-shifted_spikes = []
-for iU in tqdm(range(len(sf_sta))):
-    sf_idx = peak_sf[iU]
-    ori_idx = peak_ori[iU]
-    lag = peak_lags[iU]
+print("Computing stimulus-triggered averages for parameter tuning...")
 
-    sf_ori_idx = np.where(sf_ori_one_hot[:, sf_idx, ori_idx] > 0)[0]
-    sf_ori_idx = sf_ori_idx[(sf_ori_idx + lag) < len(robs)] # only keep indices that have enough frames after lag
+# Compute stimulus-triggered averages for each SF/orientation combination
+sf_ori_tuning = calc_sta(
+    sf_ori_encoding,
+    neural_responses.astype(np.float64),
+    N_TIME_LAGS,
+    reverse_correlate=False,
+    progress=True
+).numpy() / dt
 
-    # Compute phase for each frame
-    stim_phases = gratings_dset['stim_phase'][sf_ori_idx].numpy().squeeze()
-    if stim_phases.ndim == 3:
-        stim_phases = stim_phases[:,stim_phases.shape[1]//2, stim_phases.shape[2]//2]
-    stim_phases_shifted = gratings_dset['stim_phase_shifted'][sf_ori_idx].numpy().squeeze()
-    if stim_phases_shifted.ndim == 3:
-        stim_phases_shifted = stim_phases_shifted[:,stim_phases_shifted.shape[1]//2, stim_phases_shifted.shape[2]//2]
-    stim_spikes = robs[sf_ori_idx + lag, iU]
-    filters = gratings_dset['dfs'].numpy().squeeze()[sf_ori_idx + lag]  # use the same indices as spikes
+# Compute spatial frequency tuning (averaged across orientations)
+sf_tuning_curves = calc_sta(
+    sf_ori_encoding.sum(2, keepdims=True),
+    neural_responses.astype(np.float64),
+    N_TIME_LAGS,
+    reverse_correlate=False,
+    progress=True
+).numpy().squeeze() / dt
 
-    invalid = (stim_phases <= 0) | (filters == 0) # -1 indicates off screen or probe, 0 indicates sampled out of ROI
-    phases.append(stim_phases[~invalid])
-    spikes.append(stim_spikes[~invalid])
+print("Finding optimal parameters for each neuron...")
 
-    invalid = (stim_phases_shifted <= 0) | (filters == 0) # -1 indicates off screen or probe, 0 indicates sampled out of ROI
-    shifted_phases.append(stim_phases_shifted[~invalid])
-    shifted_spikes.append(stim_spikes[~invalid])
+# Find optimal temporal lag for each neuron
+temporal_response_strength = np.linalg.norm(sf_tuning_curves, axis=2)
+optimal_temporal_lags = np.argmax(temporal_response_strength, axis=1)
 
-n_phase_bins = 8
-phase_bin_edges = np.linspace(0, 2*np.pi, n_phase_bins + 1)
-phase_bins = np.rad2deg((phase_bin_edges[:-1] + phase_bin_edges[1:]) / 2)
-n_phases = np.zeros((len(sf_sta), n_phase_bins))
-n_spikes = np.zeros((len(sf_sta), n_phase_bins))
-phase_response = np.zeros((len(sf_sta), n_phase_bins))
-phase_response_ste = np.zeros((len(sf_sta), n_phase_bins))
+# Find optimal spatial frequency for each neuron
+sf_response_strength = np.linalg.norm(sf_tuning_curves[:, optimal_temporal_lags], axis=1)
+optimal_spatial_frequencies = np.argmax(sf_response_strength, axis=1)
 
-n_phase_shifted = np.zeros((len(sf_sta), n_phase_bins))
-n_spikes_shifted = np.zeros((len(sf_sta), n_phase_bins))
-shifted_phase_response = np.zeros((len(sf_sta), n_phase_bins))
-shifted_phase_response_ste = np.zeros((len(sf_sta), n_phase_bins))
+# Calculate spatial frequency signal-to-noise ratio
+sf_signal_to_noise = (sf_response_strength[np.arange(len(sf_response_strength)), optimal_spatial_frequencies] /
+                     np.mean(sf_response_strength, axis=1))
 
-for iU in tqdm(range(len(sf_sta))):
-    unit_phases = phases[iU]
-    unit_spikes = spikes[iU]
-    # Count spikes per phase bin
-    phase_bin_inds = np.digitize(unit_phases, phase_bin_edges) - 1  # bin index for each phase
-    for i in range(n_phase_bins):
-        n_phases[iU, i] = np.sum(phase_bin_inds == i)
-        n_spikes[iU, i] = unit_spikes[phase_bin_inds == i].sum() / dt
-        phase_response_ste[iU, i] = unit_spikes[phase_bin_inds == i].std() / np.sqrt(n_phases[iU,i]) / dt
-    phase_response[iU] = n_spikes[iU] / n_phases[iU]
+# Find optimal orientation for each neuron
+orientation_tuning = sf_ori_tuning[np.arange(len(sf_ori_tuning)), optimal_temporal_lags, optimal_spatial_frequencies]
+optimal_orientations = np.argmax(orientation_tuning, axis=1)
 
-    unit_phases = shifted_phases[iU]
-    unit_spikes = shifted_spikes[iU]
-    # Count spikes per phase bin
-    phase_bin_inds = np.digitize(unit_phases, phase_bin_edges) - 1  # bin index for each phase
-    for i in range(n_phase_bins):
-        n_phase_shifted[iU, i] = np.sum(phase_bin_inds == i)
-        n_spikes_shifted[iU, i] = unit_spikes[phase_bin_inds == i].sum() / dt
-        shifted_phase_response_ste[iU, i] = unit_spikes[phase_bin_inds == i].std() / np.sqrt(n_phases[iU,i]) / dt
-    shifted_phase_response[iU] = n_spikes_shifted[iU] / n_phase_shifted[iU]
-    
-results = []
-for iU in tqdm(range(len(sf_sta))):
-    unit_phases = phases[iU]
-    unit_spikes = spikes[iU]
-    if np.sum(unit_spikes) < 50:
-        results.append(None)
+# Calculate orientation signal-to-noise ratio
+ori_signal_to_noise = (orientation_tuning[np.arange(len(orientation_tuning)), optimal_orientations] /
+                      np.mean(orientation_tuning, axis=1))
+
+print(f"Optimal temporal lags: {optimal_temporal_lags.min()}-{optimal_temporal_lags.max()} frames")
+print(f"Optimal spatial frequencies: {unique_spatial_frequencies[optimal_spatial_frequencies].min():.2f}-{unique_spatial_frequencies[optimal_spatial_frequencies].max():.2f} cycles/deg")
+print(f"Mean SF SNR: {sf_signal_to_noise.mean():.2f} ± {sf_signal_to_noise.std():.2f}")
+print(f"Mean orientation SNR: {ori_signal_to_noise.mean():.2f} ± {ori_signal_to_noise.std():.2f}")
+
+#%%
+# ============================================================================
+# EXTRACT PHASE INFORMATION FOR OPTIMAL STIMULI
+# ============================================================================
+# For each neuron, extract phase and spike data for its preferred stimulus parameters
+
+print("Extracting phase information for optimal stimuli...")
+
+# Initialize lists to store phase and spike data
+original_phases = []  # Stimulus phases without eye movement correction
+original_spikes = []  # Corresponding spike counts
+corrected_phases = []  # Stimulus phases with eye movement correction
+corrected_spikes = []  # Corresponding spike counts
+
+# Process each neuron individually
+for unit_idx in tqdm(range(len(sf_tuning_curves)), desc="Processing units"):
+    # Get optimal parameters for this neuron
+    sf_idx = optimal_spatial_frequencies[unit_idx]
+    ori_idx = optimal_orientations[unit_idx]
+    lag = optimal_temporal_lags[unit_idx]
+
+    # Find timepoints where this neuron's preferred stimulus was shown
+    preferred_stimulus_times = np.where(sf_ori_encoding[:, sf_idx, ori_idx] > 0)[0]
+
+    # Only keep timepoints that have sufficient history for the temporal lag
+    valid_times = preferred_stimulus_times[(preferred_stimulus_times + lag) < len(neural_responses)]
+
+    # Extract stimulus phases for original data
+    stimulus_phases_original = gratings_dataset['stim_phase'][valid_times].numpy().squeeze()
+    if stimulus_phases_original.ndim == 3:
+        # If spatial, take center pixel
+        center_y, center_x = stimulus_phases_original.shape[1]//2, stimulus_phases_original.shape[2]//2
+        stimulus_phases_original = stimulus_phases_original[:, center_y, center_x]
+
+    # Extract stimulus phases for corrected data
+    stimulus_phases_corrected = gratings_dataset['stim_phase_shifted'][valid_times].numpy().squeeze()
+    if stimulus_phases_corrected.ndim == 3:
+        # If spatial, take center pixel
+        center_y, center_x = stimulus_phases_corrected.shape[1]//2, stimulus_phases_corrected.shape[2]//2
+        stimulus_phases_corrected = stimulus_phases_corrected[:, center_y, center_x]
+
+    # Extract corresponding spike counts (with temporal lag)
+    spike_counts = neural_responses[valid_times + lag, unit_idx]
+
+    # Extract validity filter (with temporal lag)
+    validity_flags = gratings_dataset['validity_filter'].numpy().squeeze()[valid_times + lag]
+
+    # Remove invalid timepoints (off-screen stimuli or unreliable eye tracking)
+    valid_original = (stimulus_phases_original > 0) & (validity_flags > 0)
+    original_phases.append(stimulus_phases_original[valid_original])
+    original_spikes.append(spike_counts[valid_original])
+
+    valid_corrected = (stimulus_phases_corrected > 0) & (validity_flags > 0)
+    corrected_phases.append(stimulus_phases_corrected[valid_corrected])
+    corrected_spikes.append(spike_counts[valid_corrected])
+
+print(f"Extracted phase data for {len(original_phases)} units")
+
+# Calculate summary statistics
+total_original_samples = sum(len(phases) for phases in original_phases)
+total_corrected_samples = sum(len(phases) for phases in corrected_phases)
+print(f"Total original samples: {total_original_samples:,}")
+print(f"Total corrected samples: {total_corrected_samples:,}")
+print(f"Average samples per unit: {total_original_samples/len(original_phases):.0f}")
+
+#%%
+# ============================================================================
+# COMPUTE PHASE TUNING CURVES
+# ============================================================================
+# Bin phase data and compute firing rates for each phase bin
+
+print("Computing phase tuning curves...")
+
+# Phase binning parameters
+N_PHASE_BINS = 8  # Number of phase bins (45° each)
+phase_bin_edges = np.linspace(0, 2*np.pi, N_PHASE_BINS + 1)
+phase_bin_centers = np.rad2deg((phase_bin_edges[:-1] + phase_bin_edges[1:]) / 2)
+
+# Initialize arrays to store phase tuning data
+n_units_phase = len(original_phases)
+phase_counts_original = np.zeros((n_units_phase, N_PHASE_BINS))
+spike_counts_original = np.zeros((n_units_phase, N_PHASE_BINS))
+phase_response_original = np.zeros((n_units_phase, N_PHASE_BINS))
+phase_response_sem_original = np.zeros((n_units_phase, N_PHASE_BINS))
+
+phase_counts_corrected = np.zeros((n_units_phase, N_PHASE_BINS))
+spike_counts_corrected = np.zeros((n_units_phase, N_PHASE_BINS))
+phase_response_corrected = np.zeros((n_units_phase, N_PHASE_BINS))
+phase_response_sem_corrected = np.zeros((n_units_phase, N_PHASE_BINS))
+
+# Compute phase tuning for each unit
+for unit_idx in tqdm(range(n_units_phase), desc="Computing phase tuning"):
+
+    # Process original (uncorrected) data
+    unit_phases_orig = original_phases[unit_idx]
+    unit_spikes_orig = original_spikes[unit_idx]
+
+    # Assign each phase sample to a bin
+    phase_bin_indices = np.digitize(unit_phases_orig, phase_bin_edges) - 1
+    phase_bin_indices = np.clip(phase_bin_indices, 0, N_PHASE_BINS - 1)  # Handle edge cases
+
+    # Compute statistics for each phase bin
+    for bin_idx in range(N_PHASE_BINS):
+        bin_mask = (phase_bin_indices == bin_idx)
+        phase_counts_original[unit_idx, bin_idx] = np.sum(bin_mask)
+
+        if np.sum(bin_mask) > 0:
+            bin_spikes = unit_spikes_orig[bin_mask]
+            spike_counts_original[unit_idx, bin_idx] = bin_spikes.sum() / dt
+            phase_response_sem_original[unit_idx, bin_idx] = (bin_spikes.std() /
+                                                            np.sqrt(len(bin_spikes)) / dt)
+
+    # Convert to firing rates (spikes per second)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        phase_response_original[unit_idx] = (spike_counts_original[unit_idx] /
+                                           phase_counts_original[unit_idx])
+
+    # Process corrected data
+    unit_phases_corr = corrected_phases[unit_idx]
+    unit_spikes_corr = corrected_spikes[unit_idx]
+
+    phase_bin_indices = np.digitize(unit_phases_corr, phase_bin_edges) - 1
+    phase_bin_indices = np.clip(phase_bin_indices, 0, N_PHASE_BINS - 1)
+
+    for bin_idx in range(N_PHASE_BINS):
+        bin_mask = (phase_bin_indices == bin_idx)
+        phase_counts_corrected[unit_idx, bin_idx] = np.sum(bin_mask)
+
+        if np.sum(bin_mask) > 0:
+            bin_spikes = unit_spikes_corr[bin_mask]
+            spike_counts_corrected[unit_idx, bin_idx] = bin_spikes.sum() / dt
+            phase_response_sem_corrected[unit_idx, bin_idx] = (bin_spikes.std() /
+                                                             np.sqrt(len(bin_spikes)) / dt)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        phase_response_corrected[unit_idx] = (spike_counts_corrected[unit_idx] /
+                                            phase_counts_corrected[unit_idx])
+
+# Replace NaN values with 0 (occurs when no samples in a bin)
+phase_response_original = np.nan_to_num(phase_response_original)
+phase_response_corrected = np.nan_to_num(phase_response_corrected)
+phase_response_sem_original = np.nan_to_num(phase_response_sem_original)
+phase_response_sem_corrected = np.nan_to_num(phase_response_sem_corrected)
+
+print(f"Computed phase tuning curves for {n_units_phase} units")
+print(f"Phase bins: {N_PHASE_BINS} bins of {360/N_PHASE_BINS:.0f}° each")
+#%%
+# ============================================================================
+# FIT SINUSOIDAL MODELS TO PHASE TUNING DATA
+# ============================================================================
+# Quantify phase tuning strength using sinusoidal fits
+
+print("Fitting sinusoidal models to phase tuning data...")
+
+# Minimum spike count threshold for reliable fitting
+MIN_SPIKES_ORIGINAL = 50
+MIN_SPIKES_CORRECTED = 50
+
+# Fit sinusoidal models to original data
+original_sine_fits = []
+for unit_idx in tqdm(range(n_units_phase), desc="Fitting original data"):
+    unit_phases = original_phases[unit_idx]
+    unit_spikes = original_spikes[unit_idx]
+
+    # Only fit if we have sufficient data
+    if np.sum(unit_spikes) < MIN_SPIKES_ORIGINAL:
+        original_sine_fits.append(None)
         continue
-    results.append(fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='observed_y'))
 
-shifted_results = []
-for iU in tqdm(range(len(sf_sta))):
-    unit_phases = shifted_phases[iU]
-    unit_spikes = shifted_spikes[iU]
-    if np.sum(unit_spikes) < 100:
-        shifted_results.append(None)
+    # Fit sinusoidal model: firing_rate = amplitude * sin(phase + phase_offset) + baseline
+    try:
+        fit_result = fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='mse')
+        original_sine_fits.append(fit_result)
+    except Exception as e:
+        print(f"Fit failed for unit {unit_idx}: {e}")
+        original_sine_fits.append(None)
+
+# Fit sinusoidal models to corrected data
+corrected_sine_fits = []
+for unit_idx in tqdm(range(n_units_phase), desc="Fitting corrected data"):
+    unit_phases = corrected_phases[unit_idx]
+    unit_spikes = corrected_spikes[unit_idx]
+
+    if np.sum(unit_spikes) < MIN_SPIKES_CORRECTED:
+        corrected_sine_fits.append(None)
         continue
-    shifted_results.append(fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='observed_y'))
+
+    try:
+        fit_result = fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='mse')
+        corrected_sine_fits.append(fit_result)
+    except Exception as e:
+        print(f"Fit failed for unit {unit_idx}: {e}")
+        corrected_sine_fits.append(None)
+
+# Count successful fits
+n_successful_original = sum(1 for fit in original_sine_fits if fit is not None)
+n_successful_corrected = sum(1 for fit in corrected_sine_fits if fit is not None)
+
+print(f"Successful sine fits:")
+print(f"  Original data: {n_successful_original}/{n_units_phase} units")
+print(f"  Corrected data: {n_successful_corrected}/{n_units_phase} units")
 
 #%%
-cid = 90
-plt.figure()
-plt.imshow(sf_ori_sta[cid, peak_lags[cid], :] * 240, cmap='viridis')
-plt.show()
-#%%
-plt.figure()
-plt.scatter(phases[cid], spikes[cid])
-plt.show()
-plt.figure()
-plt.scatter(shifted_phases[cid], shifted_spikes[cid])
-plt.xlim([0, 2*np.pi])
-plt.show()
+# ============================================================================
+# VISUALIZE EXAMPLE PHASE TUNING RESULTS
+# ============================================================================
+# Show detailed analysis for a representative neuron
 
+# Select an example unit for detailed visualization
+EXAMPLE_UNIT = 90
 
-#%%
-def plot_phase_response(res, ax=None):
-    if res is None:
-        raise ValueError('No fit')
-    amp = res['amplitude']
-    amp_se = res['amplitude_se']
-    phase_offset = res['phase_offset_rad']
-    phase_offset_se = res['phase_offset_rad_se']
-    C = res['C']
-    mi = res['modulation_index']
-    mi_se = res['modulation_index_se']
-    if np.isnan(mi) or np.isnan(mi_se) or np.isnan(amp) or np.isnan(amp_se) or np.isnan(phase_offset) or np.isnan(phase_offset_se):
-        raise ValueError('NaN in fit')
+print(f"Creating detailed visualization for unit {EXAMPLE_UNIT}...")
+def plot_phase_tuning_with_fit(fit_result, phase_data, spike_data, ax=None, title=""):
+    """
+    Plot phase tuning curve with sinusoidal fit overlay.
 
-    smoothed_phases = np.linspace(0, 2*np.pi, 100)
-    smoothed_fit = amp * np.sin(smoothed_phases + phase_offset) + C
-    smoothed_fit_max = (amp+amp_se) * np.sin(smoothed_phases + phase_offset) + C
-    smoothed_fit_min = (amp-amp_se) * np.sin(smoothed_phases + phase_offset) + C
+    Parameters:
+    -----------
+    fit_result : dict
+        Results from sine fitting function
+    phase_data : array
+        Phase values
+    spike_data : array
+        Corresponding spike counts
+    ax : matplotlib axis, optional
+        Axis to plot on
+    title : str
+        Plot title
+    """
+    if fit_result is None:
+        if ax is not None:
+            ax.text(0.5, 0.5, 'Insufficient data\nfor fitting',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(title)
+        return
+
+    # Extract fit parameters
+    amplitude = fit_result['amplitude']
+    amplitude_se = fit_result['amplitude_se']
+    phase_offset = fit_result['phase_offset_rad']
+    baseline = fit_result['C']
+    modulation_index = fit_result['modulation_index']
+    modulation_index_se = fit_result['modulation_index_se']
+
+    # Check for valid fit
+    if (np.isnan(modulation_index) or np.isnan(modulation_index_se) or
+        np.isnan(amplitude) or np.isnan(amplitude_se) or np.isnan(phase_offset)):
+        if ax is not None:
+            ax.text(0.5, 0.5, 'Fit failed\n(NaN values)',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(title)
+        return
+
+    # Generate smooth curve for visualization
+    smooth_phases = np.linspace(0, 2*np.pi, 100)
+    smooth_fit = amplitude * np.sin(smooth_phases + phase_offset) + baseline
+    smooth_fit_upper = (amplitude + amplitude_se) * np.sin(smooth_phases + phase_offset) + baseline
+    smooth_fit_lower = (amplitude - amplitude_se) * np.sin(smooth_phases + phase_offset) + baseline
 
     if ax is None:
-        fig, ax = plt.subplots()
-    ax.plot(np.rad2deg(smoothed_phases), smoothed_fit/dt, color='red')
-    ax.fill_between(np.rad2deg(smoothed_phases), smoothed_fit_min/dt, smoothed_fit_max/dt, color='red', alpha=0.2)
-    ylim = ax.get_ylim()
-    ax.set_ylim([0, ylim[1]])
-    ax.set_xlabel('Phase (radians)')
-    ax.set_ylabel('Spikes / second')
+        fig, ax = plt.subplots(figsize=(6, 4))
 
-for iU in [90]:#range(len(results)):
-    res = results[iU]
-    res_shifted = shifted_results[iU]
+    # Plot fitted curve with confidence interval
+    ax.plot(np.rad2deg(smooth_phases), smooth_fit / dt, 'red', linewidth=2, label='Fit')
+    ax.fill_between(np.rad2deg(smooth_phases), smooth_fit_lower / dt, smooth_fit_upper / dt,
+                   color='red', alpha=0.3, label='±1 SE')
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-    axs[0].errorbar(phase_bins, phase_response[iU], yerr=phase_response_ste[iU], fmt='o-', ecolor='C0', capsize=5, zorder=0)
-    axs[1].errorbar(phase_bins, shifted_phase_response[iU], yerr=shifted_phase_response_ste[iU], fmt='o-', ecolor='C0', capsize=5, zorder=0)
-    ax0_title = f'Unit {iU}\nOriginal'
-    ax1_title = f'Unit {iU}\nShifted'
-    try:
-        plot_phase_response(res, ax=axs[0])
-        plot_phase_response(res_shifted, ax=axs[1])
-        ax0_title += f'\nModulation Index {res["modulation_index"]:.2f} +/- {res["modulation_index_se"]:.2f}'
-        ax1_title += f'\nModulation Index {res_shifted["modulation_index"]:.2f} +/- {res_shifted["modulation_index_se"]:.2f}'
-    except Exception as e:
-        print(f'Error plotting unit {iU}')
-    axs[0].set_title(ax0_title)
-    axs[1].set_title(ax1_title)
+    # Set axis properties
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('Phase (degrees)')
+    ax.set_ylabel('Firing Rate (Hz)')
+    ax.set_title(f'{title}\nMI: {modulation_index:.3f} ± {modulation_index_se:.3f}')
+    ax.legend()
+
+# Create comparison plot for the example unit
+if (EXAMPLE_UNIT < len(original_sine_fits) and EXAMPLE_UNIT < len(corrected_sine_fits)):
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    # Plot original data with phase tuning curve
+    axes[0].errorbar(phase_bin_centers, phase_response_original[EXAMPLE_UNIT],
+                    yerr=phase_response_sem_original[EXAMPLE_UNIT],
+                    fmt='o-', capsize=5, label='Data', zorder=10)
+
+    plot_phase_tuning_with_fit(original_sine_fits[EXAMPLE_UNIT],
+                              original_phases[EXAMPLE_UNIT],
+                              original_spikes[EXAMPLE_UNIT],
+                              ax=axes[0], title=f'Unit {EXAMPLE_UNIT} - Original')
+
+    # Plot corrected data with phase tuning curve
+    axes[1].errorbar(phase_bin_centers, phase_response_corrected[EXAMPLE_UNIT],
+                    yerr=phase_response_sem_corrected[EXAMPLE_UNIT],
+                    fmt='o-', capsize=5, label='Data', zorder=10)
+
+    plot_phase_tuning_with_fit(corrected_sine_fits[EXAMPLE_UNIT],
+                              corrected_phases[EXAMPLE_UNIT],
+                              corrected_spikes[EXAMPLE_UNIT],
+                              ax=axes[1], title=f'Unit {EXAMPLE_UNIT} - Corrected')
+
+    plt.tight_layout()
     plt.show()
-# %%
 
-mi_original = np.array([res['modulation_index'] if res is not None else np.nan for res in results])
-mi_original_se = np.array([res['modulation_index_se'] if res is not None else np.nan for res in results])
-mi_shifted = np.array([res['modulation_index'] if res is not None else np.nan for res in shifted_results])
-mi_shifted_se = np.array([res['modulation_index_se'] if res is not None else np.nan for res in shifted_results])
-n_spikes = np.array([np.sum(spikes[iU]) for iU in range(len(sf_sta))])
+    # Print comparison statistics
+    orig_fit = original_sine_fits[EXAMPLE_UNIT]
+    corr_fit = corrected_sine_fits[EXAMPLE_UNIT]
 
-plt.figure()
-plt.scatter(mi_original, mi_shifted, c=n_spikes, cmap='viridis')
-plt.gca().set_aspect('equal', adjustable='box')
-plt.plot([0, 1], [0, 1], 'k--')
-plt.xlabel('Original Modulation Index')
-plt.ylabel('Shifted Modulation Index')
-plt.show()
+    if orig_fit is not None and corr_fit is not None:
+        print(f"\nExample Unit {EXAMPLE_UNIT} Comparison:")
+        print(f"Original MI: {orig_fit['modulation_index']:.3f} ± {orig_fit['modulation_index_se']:.3f}")
+        print(f"Corrected MI: {corr_fit['modulation_index']:.3f} ± {corr_fit['modulation_index_se']:.3f}")
+        print(f"Improvement: {corr_fit['modulation_index'] - orig_fit['modulation_index']:.3f}")
+else:
+    print(f"Example unit {EXAMPLE_UNIT} not available for detailed comparison")
 #%%
+# ============================================================================
+# 13. POPULATION-LEVEL ANALYSIS AND SUMMARY
+# ============================================================================
+# Analyze the overall effect of eye movement correction across all neurons
 
+print("Performing population-level analysis...")
+
+# Extract modulation indices from sine fits
+modulation_index_original = np.array([
+    fit['modulation_index'] if fit is not None else np.nan
+    for fit in original_sine_fits
+])
+
+modulation_index_original_se = np.array([
+    fit['modulation_index_se'] if fit is not None else np.nan
+    for fit in original_sine_fits
+])
+
+modulation_index_corrected = np.array([
+    fit['modulation_index'] if fit is not None else np.nan
+    for fit in corrected_sine_fits
+])
+
+modulation_index_corrected_se = np.array([
+    fit['modulation_index_se'] if fit is not None else np.nan
+    for fit in corrected_sine_fits
+])
+
+# Calculate total spike counts for each unit
+total_spike_counts = np.array([
+    np.sum(original_spikes[unit_idx]) if unit_idx < len(original_spikes) else 0
+    for unit_idx in range(n_units_phase)
+])
+
+# ============================================================================
+# FILTER UNITS BY ORIENTATION SIGNAL-TO-NOISE RATIO
+# ============================================================================
+# Only include units with orientation SNR >= 2 in the population analysis
+
+ORIENTATION_SNR_THRESHOLD = 2.0
+
+print(f"Filtering units by orientation signal-to-noise ratio...")
+print(f"Threshold: {ORIENTATION_SNR_THRESHOLD}")
+
+# Create mask for units with sufficient orientation tuning
+high_ori_snr_mask = ori_signal_to_noise >= ORIENTATION_SNR_THRESHOLD
+
+# Apply filter to all analysis variables
+modulation_index_original_filtered = modulation_index_original[high_ori_snr_mask]
+modulation_index_corrected_filtered = modulation_index_corrected[high_ori_snr_mask]
+ori_signal_to_noise_filtered = ori_signal_to_noise[high_ori_snr_mask]
+total_spike_counts_filtered = total_spike_counts[high_ori_snr_mask]
+
+print(f"Units before filtering: {len(modulation_index_original)}")
+print(f"Units after filtering (ori SNR >= {ORIENTATION_SNR_THRESHOLD}): {len(modulation_index_original_filtered)}")
+print(f"Filtered out: {len(modulation_index_original) - len(modulation_index_original_filtered)} units")
+
+# Create population comparison plot with filtered data
+plt.figure(figsize=(10, 8))
+
+# Main scatter plot using filtered data
+scatter = plt.scatter(modulation_index_original_filtered, modulation_index_corrected_filtered,
+                     c=ori_signal_to_noise_filtered, cmap='viridis', alpha=0.7, s=50)
+for i, unit_id in enumerate(high_ori_snr_mask.nonzero()[0]):
+    plt.text(modulation_index_original_filtered[i]+.02, 
+             modulation_index_corrected_filtered[i]+.01,
+             f'{unit_id}', fontsize=8, ha='center', va='center')
+# Add unity line
+max_mi = max(np.nanmax(modulation_index_original_filtered), np.nanmax(modulation_index_corrected_filtered))
+plt.plot([0, max_mi], [0, max_mi], 'k--', alpha=0.5, label='Unity line')
+
+# Formatting
+plt.gca().set_aspect('equal', adjustable='box')
+plt.xlabel('Original Modulation Index', fontsize=12)
+plt.ylabel('Corrected Modulation Index', fontsize=12)
+plt.title(f'Phase Tuning: Effect of Eye Movement Correction\n'
+          f'Units with Orientation SNR ≥ {ORIENTATION_SNR_THRESHOLD} (Points above unity line show improvement)', fontsize=14)
+
+# Add colorbar
+cbar = plt.colorbar(scatter)
+cbar.set_label('Orientation Signal-to-Noise Ratio', fontsize=12)
+
+# Add statistics text using filtered data
+valid_pairs_filtered = ~(np.isnan(modulation_index_original_filtered) | np.isnan(modulation_index_corrected_filtered))
+n_valid_filtered = np.sum(valid_pairs_filtered)
+
+if n_valid_filtered > 0:
+    mean_original_filtered = np.nanmean(modulation_index_original_filtered[valid_pairs_filtered])
+    mean_corrected_filtered = np.nanmean(modulation_index_corrected_filtered[valid_pairs_filtered])
+    improvement_filtered = mean_corrected_filtered - mean_original_filtered
+
+    # Count units that improved
+    improved_filtered = np.sum(modulation_index_corrected_filtered[valid_pairs_filtered] >
+                              modulation_index_original_filtered[valid_pairs_filtered])
+
+    stats_text = (f'Valid units (ori SNR ≥ {ORIENTATION_SNR_THRESHOLD}): {n_valid_filtered}\n'
+                 f'Mean original MI: {mean_original_filtered:.3f}\n'
+                 f'Mean corrected MI: {mean_corrected_filtered:.3f}\n'
+                 f'Mean improvement: {improvement_filtered:.3f}\n'
+                 f'Units improved: {improved_filtered}/{n_valid_filtered} ({100*improved_filtered/n_valid_filtered:.1f}%)')
+
+    plt.text(0.98, 0.02, stats_text, transform=plt.gca().transAxes,
+             verticalalignment='bottom', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+
+# %%
