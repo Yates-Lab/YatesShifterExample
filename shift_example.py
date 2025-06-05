@@ -11,19 +11,14 @@ import torch.nn.functional as F
 
 from utils.loss import PoissonBPSAggregator
 from utils.modules import SplitRelu, NonparametricReadout
-from utils.datasets import DictDataset
+from utils.datasets import DictDataset, generate_gaborium_dataset, generate_gratings_dataset
 from utils.general import set_seeds, ensure_tensor
 from utils.grid_sample import grid_sample_coords
 from utils.rf import calc_sta, plot_stas
 from scipy.ndimage import gaussian_filter
-
 from utils.modules import StackedConv2d 
-
-
-#%%
 from utils.exp.general import get_clock_functions, get_trial_protocols 
-from utils.exp import GaboriumTrial, BackImageTrial, GratingsTrial, FixRsvpTrial
-from utils.spikes import bin_spikes, KilosortResults
+from utils.spikes import KilosortResults
 from matplotlib.patches import Circle
 from scipy.interpolate import interp1d
 from utils.exp.dots import dots_rf_map_session
@@ -35,6 +30,7 @@ torch.set_float32_matmul_precision('medium')
 
 set_seeds(1002) # for reproducibility
 
+device = 'cuda'
 data_dir = Path('/home/ryanress/YatesShifterExample/data')
 
 exp_file = data_dir / 'Allen_2022-04-13_struct.mat'
@@ -55,6 +51,19 @@ dpi_valid = dpi['valid'].values
 dpi_interp = interp1d(t_ephys, dpi_pix, kind='linear', fill_value='extrapolate', axis=0)
 valid_interp = interp1d(t_ephys, dpi_valid, kind='nearest', fill_value='extrapolate')
 
+# Convert DPI signal from pixel locations to degrees (using small angle approximation)
+# Metadata for all datasets
+screen_resolution = (exp['S']['screenRect'][2:] - exp['S']['screenRect'][:2]).astype(int)
+screen_width = exp['S']['screenWidth']
+screen_distance = exp['S']['screenDistance']
+screen_height = screen_width * screen_resolution[1] / screen_resolution[0]
+center_pix = np.flipud((screen_resolution + 1) / 2)
+
+ppd = exp['S']['pixPerDeg'] # pixels per degree
+dpi_deg = (dpi_pix - center_pix) / ppd
+dpi_deg[:,0] *= -1
+dpi_deg = dpi_deg[:,[1,0]]
+dpi_deg_interp = interp1d(t_ephys, dpi_deg, kind='linear', fill_value='extrapolate', axis=0)
 #%%
 
 # Parameters for RF mapping 
@@ -70,7 +79,7 @@ j_edges = rf_dict['j_edges']
 i_edges = rf_dict['i_edges']
 rf_pix = rf_dict['rf_pix']
 rf_deg = rf_dict['rf_deg']
-ppd = exp['S']['pixPerDeg']
+
 
 #%%
 # Parameters for dataset rois
@@ -97,12 +106,6 @@ plt.show()
 #%%
 protocols = get_trial_protocols(exp)
 
-# Metadata for all datasets
-screen_resolution = (exp['S']['screenRect'][2:] - exp['S']['screenRect'][:2]).astype(int)
-screen_width = exp['S']['screenWidth']
-screen_distance = exp['S']['screenDistance']
-screen_height = screen_width * screen_resolution[1] / screen_resolution[0]
-
 metadata={
     'screen_resolution': screen_resolution,
     'screen_width': screen_width,
@@ -112,73 +115,14 @@ metadata={
     'roi_src': roi_src,
 }
 
-def generate_gaborium_dataset(exp, ks_results, ep_interp, roi_src, dt=1/240, metadata={}, trial_subset=.5):
-    protocols = get_trial_protocols(exp)
-    st = ks_results.spike_times
-    clu = ks_results.spike_clusters
-    cids = np.unique(clu)
-
-    # Export Gaborium dataset
-    gaborium_trials = [(iT, GaboriumTrial(exp['D'][iT], exp['S'])) for iT in range(len(exp['D'])) if protocols[iT] == 'ForageGabor']
-    print(f'There are {len(gaborium_trials)} Gaborium trials. Using {trial_subset*100:.0f}% of them.')
-    n_trials = int(len(gaborium_trials) * trial_subset)
-    print(f'Using {n_trials} trials.')
-    trial_inds = np.random.choice(len(gaborium_trials), n_trials, replace=False)
-    gaborium_trials = [gaborium_trials[iT] for iT in trial_inds]
-    gaborium_dict = {
-        't_bins': [],
-        'trial_inds': [],
-        'stim': [],
-        'robs': [],
-        'dpi_pix': [],
-        'dpi_valid': [],
-        'roi': [],
-    }
-    for iT, trial in tqdm(gaborium_trials, 'Regenerating Gaborium Stimulus'):
-        # get flip times in ephys time
-        flip_times = ptb2ephys(trial.flip_times)
-
-        # Setup bins
-        trial_bin_edges = np.arange(flip_times[0], flip_times[-1], dt)
-        trial_bins = trial_bin_edges[:-1] + dt/2
-        gaborium_dict['t_bins'].append(trial_bins)
-        gaborium_dict['trial_inds'].append(np.ones_like(trial_bins) * iT)
-
-        # Get DPI
-        trial_dpi = ep_interp(trial_bins)
-        gaborium_dict['dpi_pix'].append(trial_dpi)
-        gaborium_dict['dpi_valid'].append(valid_interp(trial_bins))
-
-        # Get ROI
-        trial_roi = trial_dpi[...,None].astype(int) + roi_src[None,...]
-        gaborium_dict['roi'].append(trial_roi)
-
-        # Get the frame index for each bin 
-        frame_inds = np.searchsorted(flip_times, trial_bins) - 1
-        frame_inds[frame_inds < 0] = 0
-
-        # Sample the stimulus for each frame
-        trial_stim = trial.get_frames(frame_inds, roi=trial_roi)
-        gaborium_dict['stim'].append(trial_stim)
-
-        # Bin spikes
-        trial_robs = bin_spikes(st, trial_bin_edges, clu, cids)
-        gaborium_dict['robs'].append(trial_robs)
-
-    if gaborium_trials:
-        for k, v in gaborium_dict.items():
-            gaborium_dict[k] = np.concatenate(v)
-
-        return DictDataset(gaborium_dict, metadata=metadata)
-    else:
-        return None
 #%%
-global dset
 dset_file = data_dir / 'gaborium.dset'
 if dset_file.exists():
     dset = DictDataset.load(dset_file)
 else:
-    dset = generate_gaborium_dataset(exp, ks_results, dpi_interp, roi_src, dt=dt, metadata=metadata)
+    dset = generate_gaborium_dataset(exp, ks_results, roi_src, 
+                                     dpi_interp, dpi_deg_interp, valid_interp, 
+                                     dt=dt, metadata=metadata)
     dset.save(dset_file)
 
 #%%
@@ -189,16 +133,6 @@ n_lags = 20
 # Normalize stimulus
 dset['stim'] = dset['stim'].float()
 dset['stim'] = (dset['stim'] - dset['stim'].mean()) / dset['stim'].std()
-
-# Convert DPI signal from pixel locations to degrees (using small angle approximation)
-dpi_pix = dset['dpi_pix'].float()
-pix_per_deg = dset.metadata['ppd']
-screen_resolution = dset.metadata['screen_resolution']
-center_pix = np.flipud((screen_resolution + 1) / 2)
-dpi_deg = (dpi_pix - center_pix) / pix_per_deg
-dpi_deg[:,0] *= -1
-dpi_deg = dpi_deg[:,[1,0]]
-dset['eyepos'] = dpi_deg.float().double()
 
 # Create a binary mask for valid eye positions
 valid_mask = np.logical_and.reduce([
@@ -216,7 +150,7 @@ min_num_spikes = 500
 # Calculate spike-triggered stimulus energy (STE)
 # Determine maximally responsive lag for each cluster
 stes = calc_sta(dset['stim'], dset['robs'], 
-                n_lags, inds=valid_inds, device='cuda', batch_size=10000,
+                n_lags, inds=valid_inds, device=device, batch_size=10000,
                 stim_modifier=lambda x: x**2, progress=True).cpu().numpy()
 
 # Find maximum energy lag for each cluster
@@ -538,7 +472,7 @@ model = ShifterModel(shifter_kwargs, cnn_kwargs)
 optimizer = torch.optim.AdamW(model.parameters(), **optimizer_hparams)
 
 val_bps_aggregator = PoissonBPSAggregator()
-n_epochs = args.max_epochs
+n_epochs = 1
 
 def train_epoch():
     for batch in (pbar := tqdm(train_loader, f'Epoch {epoch}')):
@@ -583,13 +517,13 @@ plt.show()
 
 i_slc = slice(grid_center[0] - grid_radius, grid_center[0] + grid_radius + 1)
 j_slc = slice(grid_center[1] - grid_radius, grid_center[1] + grid_radius + 1)
-pre_stas = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device='cuda', progress=True).detach().cpu().numpy().squeeze()
-pre_stes = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device='cuda', stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
+pre_stas = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device=device, progress=True).detach().cpu().numpy().squeeze()
+pre_stes = calc_sta(dset['stim'][:,i_slc, j_slc], dset['robs'], [0], batch_size=2048, device=device, stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
 
 with torch.no_grad():
     shifted_dset = model.shifter(dset[:])
-shifted_stas = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device='cuda', progress=True).detach().cpu().numpy().squeeze()
-shifted_stes = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device='cuda', stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
+shifted_stas = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device=device, progress=True).detach().cpu().numpy().squeeze()
+shifted_stes = calc_sta(shifted_dset['stim'], dset['robs'], [0], batch_size=2048, device=device, stim_modifier=lambda x: x**2, progress=True).detach().cpu().numpy().squeeze()
 
 #%%
 stas = np.stack([pre_stas, shifted_stas], axis=1)
@@ -604,7 +538,7 @@ n_rows = np.ceil(n_units / n_cols).astype(int)
 fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols*2, n_rows*2))
 for iU in range(n_units):
     ax = axs.flatten()[iU]
-    ax.set_title(f'Unit {iU}')
+    ax.set_title(f'Unit {good_ix[iU]}')
     ax.imshow(stas[iU,0], cmap='coolwarm', vmin=-1, vmax=1, 
                 extent=[0, 1, 0, 1])
     ax.imshow(stes[iU,0], cmap='coolwarm', vmin=-1, vmax=1, 
@@ -628,5 +562,231 @@ fig.subplots_adjust(hspace=0.01, wspace=0.03)
 # add colorbar
 fig.tight_layout()
 plt.show()
+#%%
+
+# gratings index
 
 #%%
+
+with torch.no_grad(): 
+    dpi_shifts = model.shifter.layers(torch.from_numpy(dpi_deg).float()).squeeze().numpy()
+dpi_pix_shifted = dpi_pix + np.fliplr(dpi_shifts)
+dpi_shifted_interp = interp1d(t_ephys, dpi_pix_shifted, kind='linear', fill_value='extrapolate', axis=0)
+
+roi_gratings = np.stack([rf_pix, rf_pix + 1], axis=1)
+
+gratings_dset_file = data_dir / 'gratings.dset'
+if gratings_dset_file.exists():
+    gratings_dset = DictDataset.load(gratings_dset_file)
+else:
+    gratings_dset = generate_gratings_dataset(exp, ks_results, roi_gratings, 
+                                              dpi_interp, dpi_deg_interp, valid_interp, dt=dt, metadata=metadata)
+    gratings_shifted_dset = generate_gratings_dataset(exp, ks_results, roi_gratings, 
+                                                      dpi_shifted_interp, dpi_deg_interp, valid_interp, dt=dt, metadata=metadata)
+    gratings_dset['stim_shifted'] = gratings_shifted_dset['stim']
+    gratings_dset['stim_phase_shifted'] = gratings_shifted_dset['stim_phase']
+    gratings_dset.save(gratings_dset_file)
+
+#%%
+
+dfs = np.logical_and.reduce([
+    np.abs(gratings_dset['eyepos'][:,0]) < valid_radius,
+    np.abs(gratings_dset['eyepos'][:,1]) < valid_radius,
+    gratings_dset['dpi_valid']
+]).astype(np.float32)
+gratings_dset['dfs'] = dfs
+
+#%%
+from utils.general import fit_sine
+
+robs = gratings_dset['robs'].numpy()
+
+sf = gratings_dset['sf'].numpy()
+sfs = np.unique(sf)
+ori = gratings_dset['ori'].numpy()
+oris = np.unique(ori)
+# one-hot embed sfs and oris
+sf_ori_one_hot = np.zeros((len(robs), len(sfs), len(oris)))
+for i in range(len(robs)):
+    sf_idx = np.where(sfs == sf[i])[0][0]
+    ori_idx = np.where(oris == ori[i])[0][0]
+    sf_ori_one_hot[i, sf_idx, ori_idx] = 1
+
+sf_ori_sta = calc_sta(sf_ori_one_hot, robs.astype(np.float64), 
+                        n_lags, 
+                        reverse_correlate=False, progress=True).numpy() / dt
+
+sf_sta = calc_sta(sf_ori_one_hot.sum(2, keepdims=True), robs.astype(np.float64), 
+                    n_lags, reverse_correlate=False, progress=True).numpy().squeeze() / dt
+
+
+temporal_tuning = np.linalg.norm(sf_sta, axis=2)
+peak_lags = np.argmax(temporal_tuning, axis=1)
+sf_tuning = np.linalg.norm(sf_sta[:,peak_lags], axis=1)
+peak_sf = np.argmax(sf_tuning, axis=1)
+sf_snr = sf_tuning[np.arange(len(sf_tuning)), peak_sf] / np.mean(sf_tuning, axis=1)
+ori_tuning = sf_ori_sta[np.arange(len(sf_ori_sta)), peak_lags, peak_sf]
+peak_ori = np.argmax(ori_tuning, axis=1)
+ori_snr = ori_tuning[np.arange(len(ori_tuning)), peak_ori] / np.mean(ori_tuning, axis=1)
+
+phases = []
+spikes = []
+shifted_phases = []
+shifted_spikes = []
+for iU in tqdm(range(len(sf_sta))):
+    sf_idx = peak_sf[iU]
+    ori_idx = peak_ori[iU]
+    lag = peak_lags[iU]
+
+    sf_ori_idx = np.where(sf_ori_one_hot[:, sf_idx, ori_idx] > 0)[0]
+    sf_ori_idx = sf_ori_idx[(sf_ori_idx + lag) < len(robs)] # only keep indices that have enough frames after lag
+
+    # Compute phase for each frame
+    stim_phases = gratings_dset['stim_phase'][sf_ori_idx].numpy().squeeze()
+    if stim_phases.ndim == 3:
+        stim_phases = stim_phases[:,stim_phases.shape[1]//2, stim_phases.shape[2]//2]
+    stim_phases_shifted = gratings_dset['stim_phase_shifted'][sf_ori_idx].numpy().squeeze()
+    if stim_phases_shifted.ndim == 3:
+        stim_phases_shifted = stim_phases_shifted[:,stim_phases_shifted.shape[1]//2, stim_phases_shifted.shape[2]//2]
+    stim_spikes = robs[sf_ori_idx + lag, iU]
+    filters = gratings_dset['dfs'].numpy().squeeze()[sf_ori_idx + lag]  # use the same indices as spikes
+
+    invalid = (stim_phases <= 0) | (filters == 0) # -1 indicates off screen or probe, 0 indicates sampled out of ROI
+    phases.append(stim_phases[~invalid])
+    spikes.append(stim_spikes[~invalid])
+
+    invalid = (stim_phases_shifted <= 0) | (filters == 0) # -1 indicates off screen or probe, 0 indicates sampled out of ROI
+    shifted_phases.append(stim_phases_shifted[~invalid])
+    shifted_spikes.append(stim_spikes[~invalid])
+
+n_phase_bins = 8
+phase_bin_edges = np.linspace(0, 2*np.pi, n_phase_bins + 1)
+phase_bins = np.rad2deg((phase_bin_edges[:-1] + phase_bin_edges[1:]) / 2)
+n_phases = np.zeros((len(sf_sta), n_phase_bins))
+n_spikes = np.zeros((len(sf_sta), n_phase_bins))
+phase_response = np.zeros((len(sf_sta), n_phase_bins))
+phase_response_ste = np.zeros((len(sf_sta), n_phase_bins))
+
+n_phase_shifted = np.zeros((len(sf_sta), n_phase_bins))
+n_spikes_shifted = np.zeros((len(sf_sta), n_phase_bins))
+shifted_phase_response = np.zeros((len(sf_sta), n_phase_bins))
+shifted_phase_response_ste = np.zeros((len(sf_sta), n_phase_bins))
+
+for iU in tqdm(range(len(sf_sta))):
+    unit_phases = phases[iU]
+    unit_spikes = spikes[iU]
+    # Count spikes per phase bin
+    phase_bin_inds = np.digitize(unit_phases, phase_bin_edges) - 1  # bin index for each phase
+    for i in range(n_phase_bins):
+        n_phases[iU, i] = np.sum(phase_bin_inds == i)
+        n_spikes[iU, i] = unit_spikes[phase_bin_inds == i].sum() / dt
+        phase_response_ste[iU, i] = unit_spikes[phase_bin_inds == i].std() / np.sqrt(n_phases[iU,i]) / dt
+    phase_response[iU] = n_spikes[iU] / n_phases[iU]
+
+    unit_phases = shifted_phases[iU]
+    unit_spikes = shifted_spikes[iU]
+    # Count spikes per phase bin
+    phase_bin_inds = np.digitize(unit_phases, phase_bin_edges) - 1  # bin index for each phase
+    for i in range(n_phase_bins):
+        n_phase_shifted[iU, i] = np.sum(phase_bin_inds == i)
+        n_spikes_shifted[iU, i] = unit_spikes[phase_bin_inds == i].sum() / dt
+        shifted_phase_response_ste[iU, i] = unit_spikes[phase_bin_inds == i].std() / np.sqrt(n_phases[iU,i]) / dt
+    shifted_phase_response[iU] = n_spikes_shifted[iU] / n_phase_shifted[iU]
+    
+results = []
+for iU in tqdm(range(len(sf_sta))):
+    unit_phases = phases[iU]
+    unit_spikes = spikes[iU]
+    if np.sum(unit_spikes) < 50:
+        results.append(None)
+        continue
+    results.append(fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='observed_y'))
+
+shifted_results = []
+for iU in tqdm(range(len(sf_sta))):
+    unit_phases = shifted_phases[iU]
+    unit_spikes = shifted_spikes[iU]
+    if np.sum(unit_spikes) < 100:
+        shifted_results.append(None)
+        continue
+    shifted_results.append(fit_sine(unit_phases, unit_spikes, omega=1.0, variance_source='observed_y'))
+
+#%%
+cid = 90
+plt.figure()
+plt.imshow(sf_ori_sta[cid, peak_lags[cid], :] * 240, cmap='viridis')
+plt.show()
+#%%
+plt.figure()
+plt.scatter(phases[cid], spikes[cid])
+plt.show()
+plt.figure()
+plt.scatter(shifted_phases[cid], shifted_spikes[cid])
+plt.xlim([0, 2*np.pi])
+plt.show()
+
+
+#%%
+def plot_phase_response(res, ax=None):
+    if res is None:
+        raise ValueError('No fit')
+    amp = res['amplitude']
+    amp_se = res['amplitude_se']
+    phase_offset = res['phase_offset_rad']
+    phase_offset_se = res['phase_offset_rad_se']
+    C = res['C']
+    mi = res['modulation_index']
+    mi_se = res['modulation_index_se']
+    if np.isnan(mi) or np.isnan(mi_se) or np.isnan(amp) or np.isnan(amp_se) or np.isnan(phase_offset) or np.isnan(phase_offset_se):
+        raise ValueError('NaN in fit')
+
+    smoothed_phases = np.linspace(0, 2*np.pi, 100)
+    smoothed_fit = amp * np.sin(smoothed_phases + phase_offset) + C
+    smoothed_fit_max = (amp+amp_se) * np.sin(smoothed_phases + phase_offset) + C
+    smoothed_fit_min = (amp-amp_se) * np.sin(smoothed_phases + phase_offset) + C
+
+    if ax is None:
+        fig, ax = plt.subplots()
+    ax.plot(np.rad2deg(smoothed_phases), smoothed_fit/dt, color='red')
+    ax.fill_between(np.rad2deg(smoothed_phases), smoothed_fit_min/dt, smoothed_fit_max/dt, color='red', alpha=0.2)
+    ylim = ax.get_ylim()
+    ax.set_ylim([0, ylim[1]])
+    ax.set_xlabel('Phase (radians)')
+    ax.set_ylabel('Spikes / second')
+
+for iU in [90]:#range(len(results)):
+    res = results[iU]
+    res_shifted = shifted_results[iU]
+
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+    axs[0].errorbar(phase_bins, phase_response[iU], yerr=phase_response_ste[iU], fmt='o-', ecolor='C0', capsize=5, zorder=0)
+    axs[1].errorbar(phase_bins, shifted_phase_response[iU], yerr=shifted_phase_response_ste[iU], fmt='o-', ecolor='C0', capsize=5, zorder=0)
+    ax0_title = f'Unit {iU}\nOriginal'
+    ax1_title = f'Unit {iU}\nShifted'
+    try:
+        plot_phase_response(res, ax=axs[0])
+        plot_phase_response(res_shifted, ax=axs[1])
+        ax0_title += f'\nModulation Index {res["modulation_index"]:.2f} +/- {res["modulation_index_se"]:.2f}'
+        ax1_title += f'\nModulation Index {res_shifted["modulation_index"]:.2f} +/- {res_shifted["modulation_index_se"]:.2f}'
+    except Exception as e:
+        print(f'Error plotting unit {iU}')
+    axs[0].set_title(ax0_title)
+    axs[1].set_title(ax1_title)
+    plt.show()
+# %%
+
+mi_original = np.array([res['modulation_index'] if res is not None else np.nan for res in results])
+mi_original_se = np.array([res['modulation_index_se'] if res is not None else np.nan for res in results])
+mi_shifted = np.array([res['modulation_index'] if res is not None else np.nan for res in shifted_results])
+mi_shifted_se = np.array([res['modulation_index_se'] if res is not None else np.nan for res in shifted_results])
+n_spikes = np.array([np.sum(spikes[iU]) for iU in range(len(sf_sta))])
+
+plt.figure()
+plt.scatter(mi_original, mi_shifted, c=n_spikes, cmap='viridis')
+plt.gca().set_aspect('equal', adjustable='box')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('Original Modulation Index')
+plt.ylabel('Shifted Modulation Index')
+plt.show()
+#%%
+

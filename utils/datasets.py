@@ -1,7 +1,12 @@
 import torch
 import numpy as np
 from copy import deepcopy
+from tqdm import tqdm
 from .general import ensure_tensor
+from .spikes import bin_spikes
+from .exp.general import get_clock_functions, get_trial_protocols
+from .exp.gratings import GratingsTrial
+from .exp.gaborium import GaboriumTrial
 
 def get_memory_footprint(t):
     '''
@@ -188,3 +193,145 @@ class DictDataset(torch.utils.data.Dataset):
         copy_metadata = deepcopy(self.metadata)
         return DictDataset(copy_covariates, metadata=copy_metadata, replicates=self.replicates)
 
+def generate_gaborium_dataset(exp, ks_results, roi_src, pix_interp, ep_interp, valid_interp, dt=1/240, metadata={}, trial_subset=.5):
+    protocols = get_trial_protocols(exp)
+    ptb2ephys, _ = get_clock_functions(exp)
+    
+    st = ks_results.spike_times
+    clu = ks_results.spike_clusters
+    cids = np.unique(clu)
+
+    # Export Gaborium dataset
+    gaborium_trials = [(iT, GaboriumTrial(exp['D'][iT], exp['S'])) for iT in range(len(exp['D'])) if protocols[iT] == 'ForageGabor']
+    print(f'There are {len(gaborium_trials)} Gaborium trials. Using {trial_subset*100:.0f}% of them.')
+    n_trials = int(len(gaborium_trials) * trial_subset)
+    print(f'Using {n_trials} trials.')
+    trial_inds = np.random.choice(len(gaborium_trials), n_trials, replace=False)
+    trial_inds = np.sort(trial_inds) # maintain trial order
+    gaborium_trials = [gaborium_trials[iT] for iT in trial_inds]
+    gaborium_dict = {
+        't_bins': [],
+        'trial_inds': [],
+        'stim': [],
+        'robs': [],
+        'dpi_pix': [],
+        'eyepos': [],
+        'dpi_valid': [],
+        'roi': [],
+    }
+    for iT, trial in tqdm(gaborium_trials, 'Regenerating Gaborium Stimulus'):
+        # get flip times in ephys time
+        flip_times = ptb2ephys(trial.flip_times)
+
+        # Setup bins
+        trial_bin_edges = np.arange(flip_times[0], flip_times[-1], dt)
+        trial_bins = trial_bin_edges[:-1] + dt/2
+        gaborium_dict['t_bins'].append(trial_bins)
+        gaborium_dict['trial_inds'].append(np.ones_like(trial_bins) * iT)
+
+        # Get DPI
+        trial_dpi = pix_interp(trial_bins)
+        gaborium_dict['dpi_pix'].append(trial_dpi)
+        gaborium_dict['eyepos'].append(ep_interp(trial_bins))
+        gaborium_dict['dpi_valid'].append(valid_interp(trial_bins))
+
+        # Get ROI
+        trial_roi = trial_dpi[...,None].astype(int) + roi_src[None,...]
+        gaborium_dict['roi'].append(trial_roi)
+
+        # Get the frame index for each bin 
+        frame_inds = np.searchsorted(flip_times, trial_bins) - 1
+        frame_inds[frame_inds < 0] = 0
+
+        # Sample the stimulus for each frame
+        trial_stim = trial.get_frames(frame_inds, roi=trial_roi)
+        gaborium_dict['stim'].append(trial_stim)
+
+        # Bin spikes
+        trial_robs = bin_spikes(st, trial_bin_edges, clu, cids)
+        gaborium_dict['robs'].append(trial_robs)
+
+    if gaborium_trials:
+        for k, v in gaborium_dict.items():
+            gaborium_dict[k] = np.concatenate(v)
+
+        return DictDataset(gaborium_dict, metadata=metadata)
+    else:
+        return None
+def generate_gratings_dataset(exp, ks_results, roi_src, 
+                              pix_interp, ep_interp, valid_interp, dt=1/240, 
+                              metadata={}, trial_subset=1):
+    protocols = get_trial_protocols(exp)
+    ptb2ephys, _ = get_clock_functions(exp)
+    st = ks_results.spike_times
+    clu = ks_results.spike_clusters
+    cids = np.unique(clu)
+
+    # Export Gratings dataset
+    trials = [(iT, GratingsTrial(exp['D'][iT], exp['S'])) for iT in range(len(exp['D'])) if protocols[iT] == 'ForageGrating']
+    print(f'There are {len(trials)} Gratings trials. Using {trial_subset*100:.0f}% of them.')
+    n_trials = int(len(trials) * trial_subset)
+    print(f'Using {n_trials} trials.')
+    trial_inds = np.random.choice(len(trials), n_trials, replace=False)
+    trial_inds = np.sort(trial_inds)
+    trials = [trials[iT] for iT in trial_inds]
+    gratings_dict = {
+            't_bins': [],
+            'stim': [],
+            'stim_phase': [],
+            'sf': [],
+            'ori': [],
+            'robs': [],
+            'dpi_pix': [],
+            'eyepos': [],
+            'dpi_valid': [],
+            'roi': [],
+            'trial_inds': [],
+        }
+    for iT, trial in tqdm(trials, 'Gratings trials'):
+        # get flip times in ephys time
+        flip_times = ptb2ephys(trial.flip_times)
+
+        # Setup bins
+        trial_bin_edges = np.arange(flip_times[0], flip_times[-1], dt)
+        trial_bins = trial_bin_edges[:-1] + dt/2
+        gratings_dict['t_bins'].append(trial_bins)
+        gratings_dict['trial_inds'].append(np.ones_like(trial_bins) * iT)
+
+        # Get DPI
+        trial_dpi = pix_interp(trial_bins)
+        gratings_dict['dpi_pix'].append(trial_dpi)
+        gratings_dict['eyepos'].append(ep_interp(trial_bins))
+        gratings_dict['dpi_valid'].append(valid_interp(trial_bins))
+
+        # Get ROI
+        trial_roi = trial_dpi[...,None].astype(int) + roi_src[None,...]
+        gratings_dict['roi'].append(trial_roi)
+
+        # Get the frame index for each bin 
+        frame_inds = np.searchsorted(flip_times, trial_bins) - 1
+        frame_inds[frame_inds < 0] = 0
+
+        # Sample the stimulus for each frame
+        trial_stim = trial.get_frames(frame_inds, roi=trial_roi)
+        gratings_dict['stim'].append(trial_stim)
+        trial_stim_phase = trial.get_frames_phase(frame_inds, roi=trial_roi)
+        gratings_dict['stim_phase'].append(trial_stim_phase)
+
+        # Get the spatial frequency and orientation for each frame
+        trial_sf = trial.spatial_frequencies[frame_inds]
+        gratings_dict['sf'].append(trial_sf)
+        trial_ori = trial.orientations[frame_inds]
+        gratings_dict['ori'].append(trial_ori)
+
+        # Bin spikes
+        trial_robs = bin_spikes(st, trial_bin_edges, clu, cids)
+        gratings_dict['robs'].append(trial_robs)
+
+    if trials:
+        for k, v in gratings_dict.items():
+            gratings_dict[k] = np.concatenate(v)
+
+        return DictDataset(gratings_dict, metadata=metadata)
+    else:
+        return None
