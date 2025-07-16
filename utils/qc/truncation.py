@@ -238,10 +238,10 @@ def plot_amplitude_truncation(spike_times, spike_amplitudes,
     axs2 = axs.twinx()
     for pct, (i0, i1) in zip(mpcts, window_blocks):
         axs2.plot([spike_times[i0], spike_times[i1]], [pct, pct], color='red', linewidth=3.5)
-    axs2.set_ylim([0, 1])
-    axs2.set_yticks([0, 1])
-    axs2.set_yticklabels(['0', '1'])
+
+    axs2.set_ylim([0, 52])
+    axs2.set_yticks([0, 50])
+    axs2.set_yticklabels(['0%', '50%'])
     axs2.tick_params(axis='y', colors='red')
     axs2.set_ylabel('Missing %', color='red')
     return fig, axs
-

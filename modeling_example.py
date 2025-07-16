@@ -60,33 +60,78 @@ data_dir = Path('/home/ryanress/YatesShifterExample/data')
 # Load experimental metadata and stimulus information
 f_dset = data_dir / 'gaborium_corrected.dset'
 
-dataset = DictDataset.load(f_dset)
-dataset['stim'] = dataset['stim'].float()
-dataset['stim'] = (dataset['stim'] - dataset['stim'].mean()) / 255
-dataset['stim'] = dataset['stim'][:,15:-15,15:-15] # Cropping to speed up computations
+gabor_dataset = DictDataset.load(f_dset)
+gabor_dataset['stim'] = gabor_dataset['stim'].float()
+gabor_dataset['stim'] = (gabor_dataset['stim'] - 127) / 255
+gabor_dataset['stim'] = gabor_dataset['stim'][:,15:-15,15:-15] # Cropping to speed up computations
+print(gabor_dataset)
 
-print(dataset)
-n_lags = 25
-
+f_natural_images = data_dir / 'natural_images.dset'
+ni_dataset = DictDataset.load(f_natural_images)
+ni_dataset['stim'] = ni_dataset['stim'].float()
+ni_dataset['stim'] = (ni_dataset['stim'] - 127) / 255
+ni_dataset['stim'] = ni_dataset['stim'][:,15:-15,15:-15] # Cropping to speed up computations
+print(ni_dataset)
 
 #%%
+# plot a gif of 240 frames of stim from each dataset side by side
+import matplotlib.animation as animation
+from IPython.display import HTML
 
-def get_inds(dset, n_lags):
+# Set up the figure with two subplots side by side
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+ax1.set_title('Gabor Dataset')
+ax2.set_title('Natural Images Dataset')
+ax1.axis('off')
+ax2.axis('off')
+
+# Number of frames to animate
+n_frames = min(240, gabor_dataset['stim'].shape[0], ni_dataset['stim'].shape[0])
+
+# Initialize images
+im1 = ax1.imshow(gabor_dataset['stim'][0], cmap='gray', animated=True)
+im2 = ax2.imshow(ni_dataset['stim'][0], cmap='gray', animated=True)
+
+def animate(frame):
+    """Update function for animation"""
+    im1.set_array(gabor_dataset['stim'][frame])
+    ax1.set_title(f'Gabor Dataset \n Eye Position: {gabor_dataset['eyepos'][frame,0]:.3f}, {gabor_dataset['eyepos'][frame,1]:.3f}')
+    im2.set_array(ni_dataset['stim'][frame])
+    ax2.set_title(f'Natural Images Dataset \n Eye Position: {ni_dataset['eyepos'][frame,0]:.3f}, {ni_dataset['eyepos'][frame,1]:.3f}')
+    return [im1, im2]
+
+# Create animation
+anim = animation.FuncAnimation(fig, animate, frames=n_frames, 
+                              interval=50, blit=True, repeat=True)
+
+# Display in notebook
+HTML(anim.to_jshtml())
+
+#%%
+# We are now going to try to model the cells responses to these two conditions using CNNs
+# First, we are going to do QC to determine which cells to include
+# Then, we are going to fit a CNN to each dataset separately and see how they generalize
+# Finally, we are going to fit a CNN to both datasets together
+#%%
+
+def get_valid_inds(dset, n_lags):
     dpi_valid = dset['dpi_valid']
     new_trials = torch.diff(dset['trial_inds'], prepend=torch.tensor([-1])) != 0
-    dfs = ~new_trials
-    dfs &= (dpi_valid > 0)
+    valid = ~new_trials
+    valid &= (dpi_valid > 0)
 
     for iL in range(n_lags):
-        dfs &= torch.roll(dfs, iL)
+        valid &= torch.roll(valid, iL)
     
-    dfs = dfs.float()
-    dfs = dfs[:, None]
-    return dfs
+    inds = torch.where(valid)[0]
 
-n_units = dataset['robs'].shape[1]
-n_y, n_x = dataset['stim'].shape[1:3]
-gaborium_inds = get_inds(dataset, n_lags).squeeze().nonzero(as_tuple=True)[0]
+    return inds
+
+n_lags = 25
+n_units = gabor_dataset['robs'].shape[1]
+n_y, n_x = gabor_dataset['stim'].shape[1:3]
+gabor_inds = get_valid_inds(gabor_dataset, n_lags)
+ni_inds = get_valid_inds(ni_dataset, n_lags)
 #%%
 # 1) QC - Refractory, Subthreshold Spikes, Visually Responsive
 # 2) Train, Val, Test Split
@@ -103,8 +148,8 @@ print("Analyzing neural response timing...")
 # STE measures how much stimulus energy drives each neuron at different time lags
 # This helps us find the optimal delay between stimulus and neural response
 spike_triggered_energies = calc_sta(
-    dataset['stim'], dataset['robs'],
-    n_lags, inds=gaborium_inds, device=device, batch_size=10000,
+    gabor_dataset['stim'], gabor_dataset['robs'],
+    n_lags, inds=gabor_inds, device=device, batch_size=10000,
     stim_modifier=lambda x: x**2,  # Square stimulus to get energy
     progress=True
 ).cpu().numpy()
@@ -171,11 +216,11 @@ for prop in [0, 20, 50, 80, 100]:
     plt.show()
 
 #%%
-CONTAMINATION_THRESHOLD = 0.6
+# Note, for this analysis we don't care about fitting MUA
+CONTAMINATION_THRESHOLD = 1 
 
-included_units = np.intersect1d(np.where(contam_props < 0.8)[0], visually_responsive_units)
+included_units = np.intersect1d(np.where(contam_props < CONTAMINATION_THRESHOLD)[0], visually_responsive_units)
 print(f'{len(included_units)} / {len(cluster_ids)} units will be included in modeling')
-
 dataset['robs'] = dataset['robs'][:, included_units]
 
 #%%
@@ -213,62 +258,6 @@ for iU in cluster_ids:
 
 
 #%%
-def plot_amplitude_truncation(spike_times, spike_amplitudes, 
-                              window_blocks, valid_blocks, mpcts, axs=None):
-    '''
-    Create visualization of amplitude truncation analysis.
-    
-    Parameters
-    ----------
-    spike_times : array-like
-        Spike timing data
-    spike_amplitudes : array-like
-        Spike amplitude data
-    window_blocks : array-like
-        Window boundary indices
-    valid_blocks : array-like
-        Valid block boundary indices
-    mpcts : array-like
-        Missing percentages for each window
-        
-    Returns
-    -------
-    tuple
-        (figure handle, axes handles)
-    '''
-    window_block_times = np.array([[spike_times[i0], spike_times[i1]] for i0, i1 in window_blocks])
-    if window_block_times.ndim == 1:
-        window_block_times = window_block_times[np.newaxis, :]
-
-    # Create mask for valid regions
-    valid_mask = np.zeros(len(spike_times), dtype=bool)
-    for i0, i1 in valid_blocks:
-        valid_mask[i0:i1] = True
-
-    # Create figure with two subplots
-    if axs is None:
-        fig, axs = plt.subplots(1, 1, figsize=(8, 6))
-    else:
-        fig = axs.get_figure()
-    
-    # Plot amplitude vs time
-    xlim = [spike_times[0], spike_times[-1]]
-    axs.hist2d(spike_times, spike_amplitudes, bins=(200, 50), cmap='Blues')
-    axs.set_xlabel('Time (s)')
-    axs.set_ylabel('Amplitude (a.u.)')
-    axs.set_title(f'Amplitude vs Time')
-    axs.set_xlim(xlim)
-
-    axs2 = axs.twinx()
-    for pct, (i0, i1) in zip(mpcts, window_blocks):
-        axs2.plot([spike_times[i0], spike_times[i1]], [pct, pct], color='red', linewidth=3.5)
-
-    axs2.set_ylim([0, 52])
-    axs2.set_yticks([0, 50])
-    axs2.set_yticklabels(['0%', '50%'])
-    axs2.tick_params(axis='y', colors='red')
-    axs2.set_ylabel('Missing %', color='red')
-    return fig, axs
 
 example_unit = 5
 
@@ -281,6 +270,7 @@ fig, axs = plot_amplitude_truncation(
 )
 axs.set_title(f'Unit {example_unit}')
 plt.show()
+
 
 #%%
 
@@ -303,35 +293,38 @@ for iU, uid in enumerate(included_units):
 
 print(f'Fraction of bins passing MPCT threshold: {dfs.float().mean().item():.3f}')
 
-dataset['dfs'] = dfs
+gabor_dataset['dfs'] = dfs
 
 #%%
 
 MIN_SPIKE_COUNT = 500  # Minimum number of spikes required per unit
-spikes_after_dfs = (dataset['robs'] * dataset['dfs']).sum(0)
+spikes_after_dfs = (gabor_dataset['robs'] * gabor_dataset['dfs']).sum(0)
 print(spikes_after_dfs)
 good_units = np.where(spikes_after_dfs > MIN_SPIKE_COUNT)[0]
 print(f'{len(good_units)} / {len(included_units)} units have enough spikes after MPCT')
-dataset['robs'] = dataset['robs'][:, good_units]
-dataset['dfs'] = dataset['dfs'][:, good_units]
+gabor_dataset['robs'] = gabor_dataset['robs'][:, good_units]
+gabor_dataset['dfs'] = gabor_dataset['dfs'][:, good_units]
 
 
 
 #%%
 
-# stas = calc_sta(dataset['stim'], dataset['robs'], 
-#                 n_lags,device='cuda', batch_size=10000,
-#                 progress=True).cpu().numpy()
+(gabor_dataset['stim'][0] == gabor_dataset['stim'][4]).all()
+#%%
 
-# plot_stas(stas[:, :, None, :, :])
-# #%%
-# stes = calc_sta(dataset['stim'], dataset['robs'], 
-#                 n_lags,device='cuda', batch_size=10000,
-#                 stim_modifier=lambda x: x**2, progress=True).cpu().numpy()
+stas = calc_sta(gabor_dataset['stim'] - gabor_dataset['stim'].mean(), gabor_dataset['robs'], 
+                n_lags, inds=gabor_inds,device='cuda', batch_size=10000,
+                progress=True).cpu().numpy()
 
-# stes -= stes.mean(axis=(1, 2,3), keepdims=True)
+plot_stas(stas[:, :, None, :, :])
+#%%
+stes = calc_sta(dataset['stim'], dataset['robs'], 
+                n_lags,device='cuda', batch_size=10000,
+                stim_modifier=lambda x: x**2, progress=True).cpu().numpy()
 
-# plot_stas(stes[:, :, None, :, :])
+stes -= stes.mean(axis=(1, 2,3), keepdims=True)
+
+plot_stas(stes[:, :, None, :, :])
 
 
 #%%

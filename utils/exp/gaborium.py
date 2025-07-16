@@ -341,8 +341,8 @@ def gen_gaborium_images(
 
         iP = 0
         for iF in progress(range(n_frames)):
-            # if the frame is the same as the previous frame, just copy the previous frame
-            if iF > 0 and frame_inds[iF] == frame_inds[iF-1]:
+            # if the frame and the roi is the same as the previous frame, just copy the previous frame
+            if iF > 0 and frame_inds[iF] == frame_inds[iF-1] and (roi[iF] == roi[iF-1]).all():
                 frames[iF] = frames[iF-1]
                 continue
 
@@ -357,8 +357,8 @@ def gen_gaborium_images(
     else: 
         iP = 0
         for iF in progress(range(n_frames)):
-            # if the frame is the same as the previous frame, just copy the previous frame
-            if iF > 0 and frame_inds[iF] == frame_inds[iF-1]:
+            # if the frame and the roi is the same as the previous frame, just copy the previous frame
+            if iF > 0 and frame_inds[iF] == frame_inds[iF-1] and (roi[iF] == roi[iF-1]).all():
                 frames[iF] = frames[iF-1]
                 continue
 
