@@ -312,7 +312,12 @@ def gen_gaborium_images(
 
     # Generate params in one go
     params = []
+    param_inds = [] # index of params for each frame
     rng = seed
+    # Generate params for each unique frame
+    # Note that we cannot skip frames so we 
+    # must generate params for every frame
+    # up to the last requested frame
     for i in range(frame_inds[-1]+1):
         p, rng = gen_gaborium_gabor_params(
             seed=rng,
@@ -326,8 +331,10 @@ def gen_gaborium_images(
             radius=radius,
             center=center,
         )
-        if i in frame_inds:
+        n_param_frames = np.sum(frame_inds == i)
+        if n_param_frames > 0:
             params.append(p)
+            param_inds.extend([i]*n_param_frames)
 
     progress = (lambda x: tqdm(x, desc='Generating Gaborium Images')) if progress else (lambda x: x)
 
@@ -339,15 +346,13 @@ def gen_gaborium_images(
                     for k in params[0].keys()}
         roi = ensure_tensor(roi, device)
 
-        iP = 0
         for iF in progress(range(n_frames)):
             # if the frame and the roi is the same as the previous frame, just copy the previous frame
             if iF > 0 and frame_inds[iF] == frame_inds[iF-1] and (roi[iF] == roi[iF-1]).all():
                 frames[iF] = frames[iF-1]
                 continue
 
-            p = {k: params[k][iP] for k in params.keys()}
-            iP += 1
+            p = {k: params[k][param_inds[iF]] for k in params.keys()}
             
             frames[iF] = gen_gaborium_image_from_params_gpu(
                 **p,
@@ -355,7 +360,6 @@ def gen_gaborium_images(
                 binSize=binSize,
             ).cpu().numpy()
     else: 
-        iP = 0
         for iF in progress(range(n_frames)):
             # if the frame and the roi is the same as the previous frame, just copy the previous frame
             if iF > 0 and frame_inds[iF] == frame_inds[iF-1] and (roi[iF] == roi[iF-1]).all():
@@ -364,18 +368,18 @@ def gen_gaborium_images(
 
             if method == 'numba':
                 frames[iF] = gen_gaborium_image_from_params_numba(
-                    **params[iP],
+                    **params[param_inds[iF]],
                     roi=roi[iF],
                     binSize=binSize,
                 )
 
             elif method == 'numpy':
                 frames[iF] = gen_gaborium_image_from_params_numpy(
-                    **params[iP],
+                    **params[param_inds[iF]],
                     roi=roi[iF],
                     binSize=binSize,
                 )
-            iP += 1
+
     # Sort the frames back into the original order
     sort_inv = np.argsort(sort)
     return frames[sort_inv]
