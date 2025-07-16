@@ -3,6 +3,163 @@ from .general import ensure_ndarray
 from pathlib import Path
 from functools import cached_property
 import pandas as pd
+from tqdm import tqdm
+
+def calc_ccgs(spike_times, bin_edges, spike_clusters = None, cids=None, progress=False):
+    """
+    Compute all pairwise cross-correlograms among the clusters appearing
+    in `spike_clusters`. Skips the correlating spikes with themselves, thus
+    the zero bin of the autocorrelogram is not the spike count.
+
+    Parameters
+    ----------
+
+    spike_times : array-like (n_spikes,)
+        Spike times in seconds.
+    bin_edges : array-like (n_bins + 1,)
+        The bin edges of the correlograms, in seconds.
+    spike_clusters : array-like (n_spikes,)
+        Spike-cluster mapping. If None, all spikes are assumed to belong to
+        a single cluster.
+    cids (optional): array-like (n_clusters,)
+        The list of clusters, in any order, to include in the computation. That order will be used
+        in the output array. If None, order the clusters by unit id from `spike_clusters`.
+
+    Returns
+    -------
+    correlograms : array
+        A `(n_clusters, n_clusters, n_bins)` array with all pairwise CCGs.
+
+    author: RKR 2/7/2024 (edited from phylib)
+    """
+    # Convert to NumPy arrays.
+    spike_times = ensure_ndarray(spike_times)
+    assert spike_times is not None
+    assert spike_times.ndim == 1
+
+    if spike_clusters is None:
+        spike_clusters = np.zeros(len(spike_times), dtype=np.int32)
+    spike_clusters = ensure_ndarray(spike_clusters, dtype=np.int32)
+    assert spike_clusters.ndim == 1
+    assert len(spike_times) == len(spike_clusters), "Spike times and spike clusters must have the same length."
+
+    if not np.all(np.diff(spike_times) >= 0):
+        sort_inds = np.argsort(spike_times)
+        spike_times = spike_times[sort_inds]
+        spike_clusters = spike_clusters[sort_inds]
+
+    spike_cluster_ids = np.unique(spike_clusters)
+    if cids is not None:
+        cids = ensure_ndarray(cids, dtype=np.int32)
+        assert np.all(np.isin(cids, spike_cluster_ids)), "Some clusters are not in spike_clusters."
+    else: 
+        cids = np.sort(spike_cluster_ids)
+
+    # Filter the spike times and clusters to include only the specified clusters.
+    if not np.all(np.isin(spike_cluster_ids, cids)):
+        cids_mask = np.isin(spike_clusters, cids)
+        spike_times = spike_times[cids_mask]
+        spike_clusters = spike_clusters[cids_mask]
+
+    n_clusters = len(cids)
+    cids2inds = np.zeros(cids.max() + 1, dtype=np.int32)
+    cids2inds[cids] = np.arange(n_clusters)
+    spike_inds = cids2inds[spike_clusters]
+
+    bin_edges = ensure_ndarray(bin_edges)
+    assert bin_edges is not None
+    assert np.all(np.diff(bin_edges) > 0), "Bin edges must be monotonically increasing."
+
+    n_bins = len(bin_edges) - 1
+    ccgs = np.zeros((n_clusters, n_clusters, n_bins), dtype=np.int32)
+
+    max_bin = bin_edges[-1]
+    min_bin = bin_edges[0]
+    mean_bin = np.mean(np.diff(bin_edges))
+    digitize = lambda x: np.digitize(x, bin_edges) - 1
+    # digitize speed up if all bin spacings are the same
+    if np.allclose(np.diff(bin_edges), mean_bin):
+        #logger.debug("Using faster digitize")
+        digitize = lambda x: ((x - min_bin) / mean_bin).astype(np.int32)
+
+    # We will constrct the correlograms by comparing shifted versions of the
+    # spike trains. For each shift we will exclude all spike pairs that fall
+    # outside the correlogram window. Then, for the remaining spike pairs, we
+    # will compute the correlogram bin the pair belongs to and increment the
+    # correlogram at that bin. We will repeat this both forward and backward
+    # in time for all bins.
+
+    # This method is sped up by leveraging the fact that once the distance
+    # between two spikes is outside the bin edges, all subsequent spikes will
+    # also be outside the bin edges. So we can skip the rest of the shifts for
+    # that spike.
+    shift = 1
+    pos_mask = np.ones(len(spike_times), dtype=bool)
+    neg_mask = np.ones(len(spike_times), dtype=bool)
+
+    # progress bar shows the number of spikes completed
+    pbar = tqdm(total = 1.0, desc="Calculating CCGs: Shift 1", position=0, leave=True, disable=not progress)
+    while True:
+        pos_mask[-shift:] = False
+        pm = pos_mask[:-shift] # mask for positive shifts
+        has_pos = np.any(pm)
+
+        if has_pos:
+            # Calculate spike time differences and find spikes to be binned
+            pos_dts = spike_times[shift:][pm] - spike_times[:-shift][pm]
+            valid_pos = (min_bin < pos_dts) & (pos_dts < max_bin)
+
+            # Get the cluster indices for the valid spikes
+            pos_i = spike_inds[:-shift][pm][valid_pos]
+            pos_j = spike_inds[shift:][pm][valid_pos]
+
+            # Digitize the spike time differences to get the bin indices
+            pos_bins = digitize(pos_dts[valid_pos])
+
+
+            # Increment the correlogram at the bin indices
+            ravel_inds = np.ravel_multi_index((pos_i, pos_j, pos_bins), ccgs.shape)
+            ravel_bin_counts = np.bincount(ravel_inds, minlength=ccgs.size)
+            ccgs += ravel_bin_counts.reshape(ccgs.shape)
+
+            # update the positive mask to exclude invalid spikes on next shift
+            pos_mask[:-shift][pm] = valid_pos
+
+        neg_mask[:shift] = False
+        nm = neg_mask[shift:] # mask for negative shifts
+        has_neg = np.any(nm)
+
+        if has_neg:
+            # Calculate spike time differences for negative shifts
+            neg_dts = spike_times[:-shift][nm] - spike_times[shift:][nm]
+            valid_neg = (min_bin < neg_dts) & (neg_dts < max_bin)
+
+            # Get the cluster indices for the valid spikes
+            neg_i = spike_inds[shift:][nm][valid_neg]
+            neg_j = spike_inds[:-shift][nm][valid_neg]
+
+            # Digitize the spike time differences to get the bin indices
+            neg_bins = digitize(neg_dts[valid_neg])
+
+            # Increment the correlogram at the bin indices
+            ravel_inds = np.ravel_multi_index((neg_i, neg_j, neg_bins), ccgs.shape)
+            ravel_bin_counts = np.bincount(ravel_inds, minlength=ccgs.size)
+            ccgs += ravel_bin_counts.reshape(ccgs.shape)
+            
+            # update the negative mask to exclude invalid spikes on next shift
+            neg_mask[shift:][nm] = valid_neg
+
+        # update the progress bar with number of spikes completed
+        pbar.n = np.round(1 - (np.sum(pos_mask) + np.sum(neg_mask)) / len(spike_times) / 2, 3)
+        pbar.set_description(f"Calculating CCGs: Shift {shift}")
+
+        if not has_pos and not has_neg:
+            break
+
+        shift += 1
+    pbar.close()
+
+    return ccgs
 
 def bin_spikes(spike_times, t_bin_edges, spike_clusters=None, cids=None, method = 'sparse', oob='clip'):
     """
