@@ -7,6 +7,7 @@
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 from tqdm import tqdm
 import pandas as pd
 import os
@@ -23,21 +24,17 @@ from scipy.interpolate import interp1d
 
 # Custom utility modules for neural data analysis
 from utils.loss import PoissonBPSAggregator
-from utils.modules import SplitRelu, NonparametricReadout, StackedConv2d
-from utils.datasets import DictDataset, generate_gaborium_dataset, generate_gratings_dataset
+from utils.modules import SplitRelu, NonparametricReadout
+from utils.datasets import DictDataset
 from utils.general import set_seeds, ensure_tensor
-from utils.grid_sample import grid_sample_coords
 from utils.rf import calc_sta, plot_stas
-from utils.exp.general import get_clock_functions, get_trial_protocols
-from utils.exp.dots import dots_rf_map_session
 from utils.spikes import KilosortResults
+from utils.datasets import CombinedEmbeddedDataset
+from utils.modules import WindowedConv2d, SplitRelu
+from utils.reg import laplacian
 
-# Matplotlib utilities
-from matplotlib.patches import Circle
 
-# Seaborn for advanced plotting
-import seaborn as sns
-
+#%%
 # ============================================================================
 # CONFIGURATION AND SETUP
 # ============================================================================
@@ -54,11 +51,11 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
 # Define data directory path
-data_dir = Path('/home/ryanress/YatesShifterExample/data')
+data_dir = Path('./data')
 
 #%%
 # ============================================================================
-# 2. LOAD SHIFTED DATASET
+# 2. LOAD SHIFTED DATASETS
 # ============================================================================
 
 # Load experimental metadata and stimulus information
@@ -112,49 +109,117 @@ plt.close(fig)
 HTML(anim.to_jshtml())
 
 #%%
-# We are now going to try to model the cells responses to these two conditions using CNNs
-# First, we are going to do QC to determine which cells to include
-# Then, we are going to fit a CNN to each dataset separately and see how they generalize
-# Finally, we are going to fit a CNN to both datasets together
-#%%
+# ============================================================================
+# 3. DATA PREPROCESSING AND QUALITY CONTROL
+# ============================================================================
+# Before training neural network models, we need to:
+# 1. Identify valid time points for analysis (avoiding trial boundaries)
+# 2. Perform quality control to select high-quality neural units
+# 3. Split data into training, validation, and test sets
 
 def get_valid_inds(dset, n_lags):
+    """
+    Find valid time indices for analysis, excluding trial boundaries and invalid periods.
+
+    When analyzing neural responses to visual stimuli, we need to exclude:
+    - Trial boundaries (where stimulus context changes abruptly)
+    - Periods marked as invalid in the dataset
+    - Time points too close to trial starts (within n_lags frames)
+
+    Parameters
+    ----------
+    dset : DictDataset
+        Dataset containing trial indices and validity markers
+    n_lags : int
+        Number of stimulus history frames needed for each prediction
+
+    Returns
+    -------
+    torch.Tensor
+        Indices of valid time points for analysis
+    """
+    # Get validity markers from dataset (e.g., eye tracking quality)
     dpi_valid = dset['dpi_valid']
+
+    # Detect trial boundaries (where trial index changes)
     new_trials = torch.diff(dset['trial_inds'], prepend=torch.tensor([-1])) != 0
+
+    # Start with points that are not at trial boundaries and are marked valid
     valid = ~new_trials
     valid &= (dpi_valid > 0)
 
+    # Exclude points too close to trial boundaries (need n_lags history)
     for iL in range(n_lags):
         valid &= torch.roll(valid, iL)
-    
-    inds = torch.where(valid)[0]
 
+    # Return indices of valid time points
+    inds = torch.where(valid)[0]
     return inds
 
-n_lags = 25
-n_units = gabor_dataset['robs'].shape[1]
-n_y, n_x = gabor_dataset['stim'].shape[1:3]
+# ============================================================================
+# ANALYSIS PARAMETERS
+# ============================================================================
+
+# Number of stimulus history frames to include in model
+n_lags = 25  # 25 frames = ~100ms at 240Hz (typical retinal response latency)
+
+# Get dataset dimensions
+n_units = gabor_dataset['robs'].shape[1]  # Number of recorded neurons
+n_y, n_x = gabor_dataset['stim'].shape[1:3]  # Stimulus spatial dimensions
+
+# Find valid time indices for both datasets
 gabor_inds = get_valid_inds(gabor_dataset, n_lags)
 ni_inds = get_valid_inds(ni_dataset, n_lags)
-#%%
-# 1) QC - Refractory, Subthreshold Spikes, Visually Responsive
-# 2) Train, Val, Test Split
-# 3) Fit LQM
-# 4) Fit CNN
-# 5) Compare across good cells
-# 6) 
-# Quality thresholds for unit selection
-SNR_THRESHOLD = 6  # Signal-to-noise ratio threshold
 
-print("Analyzing neural response timing...")
+print(f"Dataset dimensions:")
+print(f"  Stimulus: {n_y} x {n_x} pixels")
+print(f"  Units: {n_units} kilosort clusters")
+print(f"  Valid timepoints - Gabor: {len(gabor_inds)}, Natural Images: {len(ni_inds)}")
+
+#%%
+# ============================================================================
+# 3.1 NEURAL UNIT QUALITY CONTROL
+# ============================================================================
+"""
+Just because Kilosort identifies a cluster of waveforms doesn't mean
+the cluster corresponds to a single neuron (Type 1 errors), or that 
+the waveforms contain all the spikes the neuron fires (Type 2 errors).
+
+We apply several quality control checks to select the units we model.
+
+1. Visual responsiveness:
+   - Measured using spike-triggered stimulus energy (STE)
+   - Finds clusters that respond to stimulus area in localized area of the visual field
+
+2. Refractory period violations:
+   - Real neurons have ~1-2ms refractory periods where they cannot spike
+   - Violations suggest contamination from nearby neurons
+
+3. Amplitude distribution:
+   - Kilosort sets a hard amplitude threshold on spike detection
+   - Many spikes from a given neuron may fall below this threshold and not be detected
+   - The amplitude distribution of detected spikes can reveal this by 
+     the presence of a truncation in the amplitude distribution
+   - The distribution of missing spikes can change over time, so must be tracked
+"""
+
+# Quality thresholds for unit selection
+SNR_THRESHOLD = 6  # Signal-to-noise ratio threshold for visual responsiveness
+
+# ============================================================================
+# 3.1.1 VISUAL RESPONSIVENESS ANALYSIS
+# ============================================================================
+
+print("Analyzing neural response timing and visual responsiveness...")
+print("Computing spike-triggered stimulus energies...")
 
 # Calculate spike-triggered stimulus energy (STE)
 # STE measures how much stimulus energy drives each neuron at different time lags
-# This helps us find the optimal delay between stimulus and neural response
+# This is like a "reverse correlation" - what stimulus patterns preceded each spike?
 spike_triggered_energies = calc_sta(
     gabor_dataset['stim'], gabor_dataset['robs'],
     n_lags, inds=gabor_inds, device=device, batch_size=10000,
-    stim_modifier=lambda x: x**2,  # Square stimulus to get energy
+    stim_modifier=lambda x: x**2,  # Square stimulus to get energy (not contrast)
     progress=True
 ).cpu().numpy()
 
@@ -163,505 +228,868 @@ print(f"Computed STEs for {spike_triggered_energies.shape[0]} units, "
 
 # Find the optimal response lag for each neuron
 # We look for the lag that gives the strongest, most reliable response
+# Subtract median to remove baseline and focus on stimulus-driven modulation
 signal_strength = np.abs(spike_triggered_energies -
                         np.median(spike_triggered_energies, axis=(2,3), keepdims=True))
 
-# Apply spatial smoothing to reduce noise
-smoothing_kernel = [0, 2, 2, 2]  # No temporal smoothing, 2-pixel spatial smoothing
+# Apply spatial smoothing to reduce noise while preserving signal structure
+smoothing_kernel = [0, 2, 2, 2]  # [time, y, x] - no temporal, 2-pixel spatial smoothing
 signal_strength = gaussian_filter(signal_strength, smoothing_kernel)
 
-# Calculate signal-to-noise ratio for each unit and lag
-noise_level = np.median(signal_strength[:, 0], axis=(1,2))  # Use first lag as noise estimate
+# Calculate signal-to-noise ratio for each unit
+# Use first lag (earliest time) as noise estimate since visual responses are delayed
+noise_level = np.median(signal_strength[:, 0], axis=(1,2))
 signal_to_noise = np.max(signal_strength, axis=(1,2,3)) / noise_level
 
-plt.figure()
-plt.hist(signal_to_noise, bins=100)
-plt.axvline(SNR_THRESHOLD, color='red', linestyle='--')
+# Visualize the distribution of signal-to-noise ratios
+plt.figure(figsize=(10, 6))
+plt.hist(signal_to_noise, bins=100, alpha=0.7, edgecolor='black')
+plt.axvline(SNR_THRESHOLD, color='red', linestyle='--', linewidth=2,
+           label=f'Threshold = {SNR_THRESHOLD}')
 plt.xlabel('Signal-to-Noise Ratio')
-plt.ylabel('Count')
-plt.title('Distribution of Signal-to-Noise Ratios')
+plt.ylabel('Number of Units')
+plt.title('Distribution of Visual Responsiveness (Signal-to-Noise Ratios)')
+plt.legend()
+plt.grid(True, alpha=0.3)
 plt.show()
 
+# Select visually responsive units
 visually_responsive_units = np.where(signal_to_noise > SNR_THRESHOLD)[0]
-print(f'{len(visually_responsive_units)} / {n_units} units are visually responsive')
+print(f'✅ {len(visually_responsive_units)} / {n_units} units pass visual responsiveness criteria')
+print(f'   ({len(visually_responsive_units)/n_units*100:.1f}% of recorded units)')
+
+if len(visually_responsive_units) == 0:
+    print("⚠️  WARNING: No units pass visual responsiveness criteria!")
+    print("   Consider lowering SNR_THRESHOLD or checking data quality")
 #%%
-# Refractory period
+# ============================================================================
+# 3.1.2 REFRACTORY PERIOD ANALYSIS
+# ============================================================================
+"""
+Real neurons have a refractory period (~1-2ms) after each spike during which
+they cannot fire again. Violations of this biological constraint indicate:
+- Contamination from nearby neurons (spike sorting errors)
+- Noise artifacts being classified as spikes
+
+We analyze inter-spike interval (ISI) distributions to estimate contamination.
+This analysis was originally developed by the Steinmetz Lab and adapted by Ryan Ressmeyer.
+For the original code see: 
+    https://github.com/SteinmetzLab/slidingRefractory
+"""
+
+print("Loading spike sorting results and analyzing refractory periods...")
 
 # Load spike sorting results from Kilosort4
 ks4_dir = data_dir / 'Allen_2022-04-13_ks4'
 ks_results = KilosortResults(ks4_dir)
-spike_times = ks_results.spike_times  # When each spike occurred
-spike_amplitudes = ks_results.spike_amplitudes
+
+# Extract spike data
+spike_times = ks_results.spike_times  # When each spike occurred (in seconds)
+spike_amplitudes = ks_results.spike_amplitudes  # Amplitude of each spike
 spike_clusters = ks_results.spike_clusters  # Which neuron each spike came from
 cluster_ids = np.unique(spike_clusters)  # List of all neuron IDs
-print(f"Loaded {len(cluster_ids)} units with {len(spike_times)} total spikes")
+
+print(f"Loaded spike data:")
+print(f"  {len(cluster_ids)} units")
+print(f"  {len(spike_times)} total spikes")
+print(f"  Recording duration: {spike_times.max():.1f} seconds")
 
 #%%
+# Compute contamination estimates across different refractory period assumptions
 from utils.qc import compute_min_contam_props, plot_min_contam_prop
 
+print("Computing contamination estimates...")
+
+# Test range of refractory periods (1-10ms)
 refractory_periods = np.exp(np.linspace(np.log(1e-3), np.log(10e-3), 100))
+
+# Compute minimum contamination proportion for each unit
+# This estimates what fraction of spikes are likely contamination
 min_contam_props, firing_rates = compute_min_contam_props(
-    spike_times, spike_clusters, refractory_periods=refractory_periods, ref_acg_t_start=.25e-3, progress=True)
-#%%
+    spike_times, spike_clusters,
+    refractory_periods=refractory_periods,
+    ref_acg_t_start=.25e-3,  # Start analysis at 0.25ms (absolute refractory period)
+    progress=True
+)
+
+# Take the minimum contamination across all tested refractory periods
 contam_props = min_contam_props.min(axis=1)
 
-plt.figure()
-plt.hist(contam_props, bins=50)
+# Visualize contamination distribution
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.hist(contam_props, bins=50, alpha=0.7, edgecolor='black')
+plt.xlabel('Contamination Proportion')
+plt.ylabel('Number of Units')
+plt.title('Distribution of Estimated Contamination')
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.scatter(firing_rates, contam_props, alpha=0.6)
+plt.xlabel('Firing Rate (Hz)')
+plt.ylabel('Contamination Proportion')
+plt.title('Contamination vs Firing Rate')
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 
+# Show examples of units with different contamination levels
+print("\nExample units with different contamination levels:")
 for prop in [0, 20, 50, 80, 100]:
     closest_ind = np.argmin(np.abs(contam_props - prop/100))
-    print(f'{prop}%: {closest_ind}')
-    isis = np.diff(spike_times[spike_clusters == closest_ind]) * 1000
+    unit_id = cluster_ids[closest_ind]
 
-    fig, axs = plot_min_contam_prop(spike_times[spike_clusters == closest_ind], min_contam_props[closest_ind], refractory_periods)
+    print(f'{prop}% contamination example: Unit {unit_id}')
 
-    axs.set_title(f'Unit {closest_ind} - {len(isis)} spikes ({firing_rates[closest_ind]:.2f} Hz) - {contam_props[closest_ind]*100:.1f}% contamination')
+    # Plot detailed analysis for this unit
+    fig, axs = plot_min_contam_prop(
+        spike_times[spike_clusters == unit_id],
+        min_contam_props[closest_ind],
+        refractory_periods
+    )
+
+    # Add informative title
+    n_spikes = np.sum(spike_clusters == unit_id)
+    axs.set_title(f'Unit {unit_id} - {n_spikes} spikes '
+                 f'({firing_rates[closest_ind]:.2f} Hz) - '
+                 f'{contam_props[closest_ind]*100:.1f}% contamination')
     plt.show()
 
 #%%
-# Note, for this analysis we don't care about fitting MUA
-CONTAMINATION_THRESHOLD = .75 #1 
+# ============================================================================
+# 3.1.3 APPLY CONTAMINATION THRESHOLD
+# ============================================================================
 
-included_units = np.intersect1d(np.where(contam_props <= CONTAMINATION_THRESHOLD)[0], visually_responsive_units)
-print(f'{len(included_units)} / {len(cluster_ids)} units will be included in modeling')
+# Set contamination threshold
+CONTAMINATION_THRESHOLD = 0.75  # Allow up to 75% contamination
+
+print(f"Applying contamination threshold of {CONTAMINATION_THRESHOLD*100}%...")
+
+# Find units that pass both visual responsiveness AND contamination criteria
+contamination_pass = np.where(contam_props <= CONTAMINATION_THRESHOLD)[0]
+included_units = np.intersect1d(contamination_pass, visually_responsive_units)
+
+print(f"Quality control summary:")
+print(f"  Visual responsiveness: {len(visually_responsive_units)}/{len(cluster_ids)} units")
+print(f"  Contamination < {CONTAMINATION_THRESHOLD*100}%: {len(contamination_pass)}/{len(cluster_ids)} units")
+print(f"  ✅ Both criteria: {len(included_units)}/{len(cluster_ids)} units")
+print(f"  Final inclusion rate: {len(included_units)/len(cluster_ids)*100:.1f}%")
+
+# Update datasets to include only high-quality units
 gabor_dataset['robs'] = gabor_dataset['robs'][:, included_units]
 ni_dataset['robs'] = ni_dataset['robs'][:, included_units]
 
 #%%
-example_unit = 5
+# ============================================================================
+# 3.1.4 VISUALIZE SPIKE CHARACTERISTICS
+# ============================================================================
+
+# Show example spike characteristics for a representative unit
+if len(included_units) > 5:
+    example_unit_idx = 5
+    example_unit = cluster_ids[included_units[example_unit_idx]]
+else:
+    example_unit_idx = 0
+    example_unit = cluster_ids[included_units[example_unit_idx]]
+
+print(f"Examining spike characteristics for Unit {example_unit}...")
+
 fig, axs = plt.subplots(1, 2, figsize=(12, 5), width_ratios=[2, 1])
+
+# Plot 1: Spike amplitudes over time
 plt.subplot(121)
-plt.hist2d(spike_times[spike_clusters == example_unit], spike_amplitudes[spike_clusters == example_unit], bins=(200, 50), cmap='Purples')
+unit_mask = spike_clusters == example_unit
+unit_times = spike_times[unit_mask]
+unit_amps = spike_amplitudes[unit_mask]
+
+plt.hist2d(unit_times, unit_amps, bins=(200, 50), cmap='Purples')
 plt.xlabel('Time (s)')
-plt.ylabel('Amplitude (a.u.)')
-plt.title(f'Unit {example_unit}')
+plt.ylabel('Spike Amplitude (a.u.)')
+plt.title(f'Unit {example_unit}: Spike Amplitudes Over Time')
+plt.colorbar(label='Spike Count')
+
+# Plot 2: Inter-spike interval distribution
 plt.subplot(122)
-plt.hist(np.diff(spike_times[spike_clusters == example_unit])*1000, bins=np.linspace(0, 10, 50))
-plt.xlabel('ISI (s)')
+isis = np.diff(unit_times) * 1000  # Convert to milliseconds
+plt.hist(isis, bins=np.linspace(0, 10, 50), alpha=0.7, edgecolor='black')
+plt.axvline(2, color='red', linestyle='--', label='2ms refractory period')
+plt.xlabel('Inter-Spike Interval (ms)')
+plt.ylabel('Count')
+plt.title(f'ISI Distribution')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 
+print(f"Unit {example_unit} statistics:")
+print(f"  Total spikes: {len(unit_times)}")
+print(f"  Firing rate: {len(unit_times)/(unit_times.max()-unit_times.min()):.2f} Hz")
+print(f"  Refractory violations (<2ms): {np.sum(isis < 2)} ({np.sum(isis < 2)/len(isis)*100:.2f}%)")
+
 #%%
+# ============================================================================
+# 3.1.5 AMPLITUDE STABILITY ANALYSIS
+# ============================================================================
+"""
+Kilosort uses a hard amplitude threshold to detect spikes.
+This can lead to missing spikes from weak neural responses.
+
+We track the "missing percentage" (MPCT) over time to identify periods
+of poor recording quality that should be excluded from analysis.
+"""
+
+print("Analyzing spike amplitude stability over time...")
 
 from utils.qc import analyze_amplitude_truncation, plot_amplitude_truncation
 
+# Analyze amplitude stability for all units
 amplitude_results = []
 
-for iU in cluster_ids:
+print("Computing amplitude truncation analysis for all units...")
+for iU in tqdm(cluster_ids, desc="Analyzing units"):
+    # Get spikes for this unit
     st_clu = spike_times[spike_clusters == iU]
     amp_clu = spike_amplitudes[spike_clusters == iU]
 
-    window_blocks, valid_blocks, popts, mpcts = analyze_amplitude_truncation(st_clu, amp_clu, max_isi=np.inf)
+    # Analyze amplitude changes over time
+    window_blocks, valid_blocks, popts, mpcts = analyze_amplitude_truncation(
+        st_clu, amp_clu, max_isi=np.inf
+    )
+
     amplitude_results.append({
-        'cid' : iU,
-        'window_blocks' : window_blocks,
-        'valid_blocks' : valid_blocks,
-        'popts' : popts,
-        'mpcts' : mpcts,
+        'cid': iU,
+        'window_blocks': window_blocks,
+        'valid_blocks': valid_blocks,
+        'popts': popts,
+        'mpcts': mpcts,  # Missing percentage over time
     })
 
-
+print(f"Completed amplitude analysis for {len(amplitude_results)} units")
 
 #%%
+# ============================================================================
+# 3.1.6 VISUALIZE AMPLITUDE STABILITY EXAMPLE
+# ============================================================================
 
-example_unit = 5
+# Show detailed amplitude analysis for the same example unit
+example_unit_global_idx = np.where(cluster_ids == example_unit)[0][0]
+
+print(f"Detailed amplitude analysis for Unit {example_unit}:")
 
 fig, axs = plot_amplitude_truncation(
     spike_times[spike_clusters == example_unit],
-    spike_amplitudes[spike_clusters == example_unit], 
-    amplitude_results[example_unit]['window_blocks'],
-    amplitude_results[example_unit]['valid_blocks'],
-    amplitude_results[example_unit]['mpcts'],
+    spike_amplitudes[spike_clusters == example_unit],
+    amplitude_results[example_unit_global_idx]['window_blocks'],
+    amplitude_results[example_unit_global_idx]['valid_blocks'],
+    amplitude_results[example_unit_global_idx]['mpcts'],
 )
-axs.set_title(f'Unit {example_unit}')
+
+axs.set_title(f'Unit {example_unit}: Amplitude Stability Analysis\n'
+             f'Red line shows estimated "missing percentage" over time')
 plt.show()
+
+# Explain what we're seeing
+mpcts = amplitude_results[example_unit_global_idx]['mpcts']
+if len(mpcts) > 0:
+    print(f"Missing percentage range: {np.min(mpcts):.1f}% - {np.max(mpcts):.1f}%")
+    print(f"Average missing percentage: {np.mean(mpcts):.1f}%")
+else:
+    print("No amplitude windows detected for this unit")
 
 
 #%%
+# ============================================================================
+# 3.1.7 APPLY AMPLITUDE-BASED QUALITY CONTROL
+# ============================================================================
+"""
+Here we use the amplitude analysis to create a time-varying quality mask
+for each unit. We refer to this mask as the "data filters" (dfs) for each unit.
+This allows us to exclude periods of poor recording quality from the loss
+calculation when training the model. 
+"""
 
-MPCT_THRESHOLD = 30
+# Set threshold for missing percentage
+MPCT_THRESHOLD = 30  # Exclude periods with >30% estimated missing spikes
 
+print(f"Creating time-varying quality masks (MPCT threshold: {MPCT_THRESHOLD}%)...")
+
+# Initialize quality masks (degrees of freedom) for both datasets
 gabor_dfs = torch.zeros_like(gabor_dataset['robs'])
 ni_dfs = torch.zeros_like(ni_dataset['robs'])
 
+# Process each included unit
 for iU, uid in enumerate(included_units):
+    # Get spike times for this unit
     st_clu = spike_times[spike_clusters == uid]
-    window_blocks = np.array(amplitude_results[uid]['window_blocks']).flatten()
+
+    # Get amplitude analysis results
+    uid_idx = np.where(cluster_ids == uid)[0][0]  # Find index in amplitude_results
+    window_blocks = np.array(amplitude_results[uid_idx]['window_blocks']).flatten()
+
     if len(window_blocks) == 0:
+        # No amplitude windows detected - include all timepoints
+        gabor_dfs[:, iU] = 1
+        ni_dfs[:, iU] = 1
         continue
+
+    # Get times corresponding to amplitude windows
     window_times = st_clu[window_blocks]
-    
-    mpcts = amplitude_results[uid]['mpcts']
-    # if np.allclose(mpcts, 50):
-    #     print(f'Unit {uid} is low amplitude, including as MUA')
-    #     gabor_dfs[:, iU] = 1
-    #     ni_dfs[:, iU] = 1
-        #continue
-    mpct_interpolant = interp1d(window_times, np.repeat(mpcts, 2), kind='linear', fill_value=50, bounds_error=False)
-    mpct_bins = mpct_interpolant(gabor_dataset['t_bins'])
-    gabor_dfs[:, iU] = torch.from_numpy(mpct_bins < MPCT_THRESHOLD).float()
-    mpct_bins = mpct_interpolant(ni_dataset['t_bins'])
-    ni_dfs[:, iU] = torch.from_numpy(mpct_bins < MPCT_THRESHOLD).float()
+    mpcts = amplitude_results[uid_idx]['mpcts']
 
-print(f'Fraction of bins passing MPCT threshold. Gabor: {gabor_dfs.mean().item():.3f}, NI: {ni_dfs.mean().item():.3f}')
+    # Interpolate missing percentages to dataset time bins
+    # Use linear interpolation with constant extrapolation
+    mpct_interpolant = interp1d(
+        window_times, np.repeat(mpcts, 2),
+        kind='linear', fill_value=50, bounds_error=False
+    )
 
+    # Apply to both datasets
+    mpct_bins_gabor = mpct_interpolant(gabor_dataset['t_bins'])
+    gabor_dfs[:, iU] = torch.from_numpy(mpct_bins_gabor < MPCT_THRESHOLD).float()
+
+    mpct_bins_ni = mpct_interpolant(ni_dataset['t_bins'])
+    ni_dfs[:, iU] = torch.from_numpy(mpct_bins_ni < MPCT_THRESHOLD).float()
+
+# Add quality masks to datasets
 gabor_dataset['dfs'] = gabor_dfs
 ni_dataset['dfs'] = ni_dfs
 
-#%%
-
-MIN_SPIKE_COUNT = 500  # Minimum number of spikes required per unit
-spikes_after_dfs_gabor = (gabor_dataset['robs'] * gabor_dataset['dfs']).sum(0)
-spikes_after_dfs_ni = (ni_dataset['robs'] * ni_dataset['dfs']).sum(0)
-good_units = np.where((spikes_after_dfs_gabor > MIN_SPIKE_COUNT) & (spikes_after_dfs_ni > MIN_SPIKE_COUNT))[0]
-print(f'{len(good_units)} / {len(included_units)} units have enough spikes after MPCT')
-gabor_dataset['robs'] = gabor_dataset['robs'][:, good_units]
-gabor_dataset['dfs'] = gabor_dataset['dfs'][:, good_units]
-ni_dataset['robs'] = ni_dataset['robs'][:, good_units]
-ni_dataset['dfs'] = ni_dataset['dfs'][:, good_units]
+print(f'Time bins passing MPCT threshold:')
+print(f'  Gabor dataset: {gabor_dfs.mean().item():.1%}')
+print(f'  Natural images dataset: {ni_dfs.mean().item():.1%}')
 
 #%%
+# ============================================================================
+# 3.1.8 FINAL UNIT SELECTION
+# ============================================================================
+"""
+Apply final criterion: units must have sufficient spikes in both datasets
+after all quality control measures.
+"""
 
-stas = calc_sta(gabor_dataset['stim'] - gabor_dataset['stim'].mean(), gabor_dataset['robs'], 
-                n_lags, inds=gabor_inds,device='cuda', batch_size=10000,
-                progress=True).cpu().numpy()
+MIN_SPIKE_COUNT = 500  # Minimum number of high-quality spikes required per unit
 
-plot_stas(stas[:, :, None, :, :])
+print(f"Applying final spike count criterion (minimum {MIN_SPIKE_COUNT} spikes)...")
+
+# Count high-quality spikes for each unit in each dataset
+spikes_after_qc_gabor = (gabor_dataset['robs'] * gabor_dataset['dfs']).sum(0)
+spikes_after_qc_ni = (ni_dataset['robs'] * ni_dataset['dfs']).sum(0)
+
+# Find units with sufficient spikes in BOTH datasets
+sufficient_spikes = (spikes_after_qc_gabor > MIN_SPIKE_COUNT) & (spikes_after_qc_ni > MIN_SPIKE_COUNT)
+final_units = np.where(sufficient_spikes)[0]
+
+print(f"Final unit selection:")
+print(f"  Units after initial QC: {len(included_units)}")
+print(f"  Units with >{MIN_SPIKE_COUNT} spikes in Gabor: {(spikes_after_qc_gabor > MIN_SPIKE_COUNT).sum()}")
+print(f"  Units with >{MIN_SPIKE_COUNT} spikes in NI: {(spikes_after_qc_ni > MIN_SPIKE_COUNT).sum()}")
+print(f"  ✅ Final units for modeling: {len(final_units)}")
+
+# Update datasets to include only final units
+gabor_dataset['robs'] = gabor_dataset['robs'][:, final_units]
+gabor_dataset['dfs'] = gabor_dataset['dfs'][:, final_units]
+ni_dataset['robs'] = ni_dataset['robs'][:, final_units]
+ni_dataset['dfs'] = ni_dataset['dfs'][:, final_units]
+
+# Print summary statistics
+print(f"\nFinal dataset summary:")
+print(f"  Total high-quality spikes in Gabor: {(gabor_dataset['robs'] * gabor_dataset['dfs']).sum().item():.0f}")
+print(f"  Total high-quality spikes in NI: {(ni_dataset['robs'] * ni_dataset['dfs']).sum().item():.0f}")
+print(f"  Average firing rate per unit: {(gabor_dataset['robs'] * gabor_dataset['dfs']).sum(0).mean().item():.1f} spikes")
+
 #%%
-stes = calc_sta(gabor_dataset['stim'], gabor_dataset['robs'], 
-                n_lags,device='cuda', batch_size=10000,
-                stim_modifier=lambda x: x**2, progress=True).cpu().numpy()
+# ============================================================================
+# 3.2 VISUALIZE RECEPTIVE FIELDS
+# ============================================================================
+"""
+Now that we have high-quality units, let's visualize their receptive fields
+using spike-triggered averages (STAs). This helps us understand what visual
+features each neuron responds to.
+"""
 
-stes -= stes.mean(axis=(1, 2,3), keepdims=True)
+print("Computing spike-triggered averages (STAs) for final units...")
 
-plot_stas(stes[:, :, None, :, :])
+# Compute STAs using contrast (mean-subtracted stimulus)
+stas = calc_sta(
+    gabor_dataset['stim'] - gabor_dataset['stim'].mean(),
+    gabor_dataset['robs'],
+    n_lags, inds=gabor_inds, device=device, batch_size=10000,
+    progress=True
+).cpu().numpy()
+
+print(f"Computed STAs for {stas.shape[0]} units")
+
+# Visualize receptive fields
+print("Displaying receptive field maps...")
+fig, axs = plot_stas(stas[:, :, None, :, :])
+axs.set_title('Spike-Triggered Average (STA)')
+plt.show()
 
 #%%
+# Also compute spike-triggered energies for comparison
+print("Computing spike-triggered energies (STEs)...")
 
-from utils.datasets import CombinedEmbeddedDataset
+stes = calc_sta(
+    gabor_dataset['stim'], gabor_dataset['robs'],
+    n_lags, device=device, batch_size=10000,
+    stim_modifier=lambda x: x**2,  # Square for energy
+    progress=True
+).cpu().numpy()
 
+# Remove mean to highlight stimulus-driven modulation
+stes -= stes.mean(axis=(1, 2, 3), keepdims=True)
+
+print("Displaying energy-based receptive field maps...")
+fig, axs = plot_stas(stes[:, :, None, :, :])
+axs.set_title('Spike-Triggered Energy (STE)')
+plt.show()
+
+#%%
+# ============================================================================
+# 4. DATA SPLITTING AND DATASET PREPARATION
+# ============================================================================
+"""
+For robust model evaluation, we need to split our data into:
+- Training set: Used to optimize model parameters
+- Validation set: Used for hyperparameter tuning and early stopping
+- Test set: Used for final, unbiased performance evaluation
+
+Important: We split by TRIALS, not individual timepoints, to avoid
+data leakage between sets.
+"""
+
+
+# Define which data keys need which temporal lags
 keys_lags = {
-    'robs': 0,
-    'dfs': 0,
-    'stim': np.arange(n_lags),
+    'robs': 0,        # Neural responses (current timepoint)
+    'dfs': 0,         # Quality flags (current timepoint)
+    'stim': np.arange(n_lags),  # Stimulus history (past n_lags timepoints)
 }
 
-train_val_split = 0.8
+print("Setting up data splitting strategy...")
+print(f"Using {n_lags} stimulus history frames for each prediction")
 
+
+#%%
+# ============================================================================
+# 4.1 TRIAL-BASED DATA SPLITTING FUNCTION
+# ============================================================================
 
 def split_inds_by_trial(dset, inds, splits, seed=1002):
-    '''
-    Split indices by trial into training and validation sets.
+    """
+    Split data indices by trial to avoid data leakage between train/val/test sets.
+
+    This is crucial for neural data analysis because consecutive timepoints
+    within a trial are highly correlated. Random splitting would allow the
+    model to "cheat" by learning from nearby timepoints.
 
     Parameters
     ----------
     dset : DictDataset
-        The dataset containing trial indices.
+        Dataset containing trial indices
     inds : torch.Tensor
-        The indices to split.
-    splits : list of floats
-        The fractions of indices to use for each split. The sum of the splits should be 1 or less.
+        Valid time indices to split
+    splits : list of float
+        Fraction of trials for each split (must sum to ≤1)
     seed : int, optional
-        The random seed. The default is 1002.
+        Random seed for reproducibility
 
     Returns
     -------
     list of torch.Tensor
-        The indices for each split.
-    '''
+        Time indices for each split
+    """
+    assert np.sum(splits) <= 1, 'Split fractions must sum to 1 or less'
 
-    assert np.sum(splits) <= 1, 'Splits must sum to 1 or less'
-
+    # Set random seed for reproducible splits
     set_seeds(seed)
+
+    # Get unique trial IDs and randomize their order
     trials = dset['trial_inds'].unique()
     rand_trials = torch.randperm(len(trials))
-    split_inds = [int(len(trials) * split) for split in splits]
-    split_trials = [trials[rand_trials[sum(split_inds[:i]):sum(split_inds[:i+1])]] for i in range(len(split_inds))]
-    split_inds = [inds[torch.isin(dset['trial_inds'][inds], split_trials[i])] for i in range(len(split_inds))]
+
+    # Calculate number of trials for each split
+    split_sizes = [int(len(trials) * split) for split in splits]
+
+    # Assign trials to each split
+    split_trials = []
+    start_idx = 0
+    for size in split_sizes:
+        end_idx = start_idx + size
+        split_trials.append(trials[rand_trials[start_idx:end_idx]])
+        start_idx = end_idx
+
+    # Convert trial assignments to time index assignments
+    split_inds = []
+    for trial_subset in split_trials:
+        # Find time indices belonging to trials in this split
+        mask = torch.isin(dset['trial_inds'][inds], trial_subset)
+        split_inds.append(inds[mask])
+
     return split_inds
 
+#%%
+# ============================================================================
+# 4.2 CREATE TRAIN/VALIDATION/TEST SPLITS
+# ============================================================================
 
-train_val_test_split = [.6, .2, .2]
+# Define split proportions
+train_val_test_split = [0.6, 0.2, 0.2]  # 60% train, 20% val, 20% test
 
-gabor_train_inds, gabor_val_inds, gabor_test_inds = split_inds_by_trial(gabor_dataset, gabor_inds, train_val_test_split)
-print(f'Gaborium sample split: {len(gabor_train_inds) / len(gabor_inds):.3f} train, {len(gabor_val_inds) / len(gabor_inds):.3f} val, {len(gabor_test_inds) / len(gabor_inds):.3f} test')
+print("Creating trial-based data splits...")
 
-gabor_train_dataset = CombinedEmbeddedDataset(gabor_dataset,
-                                    gabor_train_inds,
-                                    keys_lags,
-                                    'cpu')
+# Split Gabor dataset
+gabor_train_inds, gabor_val_inds, gabor_test_inds = split_inds_by_trial(
+    gabor_dataset, gabor_inds, train_val_test_split
+)
 
+print(f'Gabor dataset splits:')
+print(f'  Train: {len(gabor_train_inds):,} samples ({len(gabor_train_inds)/len(gabor_inds):.1%})')
+print(f'  Val:   {len(gabor_val_inds):,} samples ({len(gabor_val_inds)/len(gabor_inds):.1%})')
+print(f'  Test:  {len(gabor_test_inds):,} samples ({len(gabor_test_inds)/len(gabor_inds):.1%})')
 
-gabor_val_dataset = CombinedEmbeddedDataset(gabor_dataset,
-                                   gabor_val_inds,
-                                   keys_lags,
-                                   'cpu')
+# Split Natural Images dataset
+ni_train_inds, ni_val_inds, ni_test_inds = split_inds_by_trial(
+    ni_dataset, ni_inds, train_val_test_split
+)
 
-gabor_test_dataset = CombinedEmbeddedDataset(gabor_dataset,
-                                   gabor_test_inds,
-                                   keys_lags,
-                                   'cpu')
-
-
-ni_train_inds, ni_val_inds, ni_test_inds = split_inds_by_trial(ni_dataset, ni_inds, train_val_test_split)
-print(f'Natural images sample split: {len(ni_train_inds) / len(ni_inds):.3f} train, {len(ni_val_inds) / len(ni_inds):.3f} val, {len(ni_test_inds) / len(ni_inds):.3f} test')
-
-ni_train_dataset = CombinedEmbeddedDataset(ni_dataset,
-                                    ni_train_inds,
-                                    keys_lags,
-                                    'cpu')
-
-ni_val_dataset = CombinedEmbeddedDataset(ni_dataset,
-                                   ni_val_inds,
-                                   keys_lags,
-                                   'cpu')
-
-ni_test_dataset = CombinedEmbeddedDataset(ni_dataset,
-                                   ni_test_inds,
-                                   keys_lags,
-                                   'cpu')
-
-both_train_dataset = CombinedEmbeddedDataset([gabor_dataset, ni_dataset],
-                                    [gabor_train_inds, ni_train_inds],
-                                    keys_lags,
-                                    'cpu')
-
-both_val_dataset = CombinedEmbeddedDataset([gabor_dataset, ni_dataset],
-                                    [gabor_val_inds, ni_val_inds],
-                                    keys_lags,
-                                    'cpu')
-
-both_test_dataset = CombinedEmbeddedDataset([gabor_dataset, ni_dataset],
-                                    [gabor_test_inds, ni_test_inds],
-                                    keys_lags,
-                                    'cpu')
+print(f'\nNatural Images dataset splits:')
+print(f'  Train: {len(ni_train_inds):,} samples ({len(ni_train_inds)/len(ni_inds):.1%})')
+print(f'  Val:   {len(ni_val_inds):,} samples ({len(ni_val_inds)/len(ni_inds):.1%})')
+print(f'  Test:  {len(ni_test_inds):,} samples ({len(ni_test_inds)/len(ni_inds):.1%})')
 
 #%%
+# ============================================================================
+# 4.3 CREATE PYTORCH DATASETS
+# ============================================================================
+
+print("\nCreating PyTorch datasets with temporal embedding...")
+
+# Individual dataset splits
+gabor_train_dataset = CombinedEmbeddedDataset(gabor_dataset, gabor_train_inds, keys_lags, 'cpu')
+gabor_val_dataset = CombinedEmbeddedDataset(gabor_dataset, gabor_val_inds, keys_lags, 'cpu')
+gabor_test_dataset = CombinedEmbeddedDataset(gabor_dataset, gabor_test_inds, keys_lags, 'cpu')
+
+ni_train_dataset = CombinedEmbeddedDataset(ni_dataset, ni_train_inds, keys_lags, 'cpu')
+ni_val_dataset = CombinedEmbeddedDataset(ni_dataset, ni_val_inds, keys_lags, 'cpu')
+ni_test_dataset = CombinedEmbeddedDataset(ni_dataset, ni_test_inds, keys_lags, 'cpu')
+
+# Combined datasets (for training on both stimulus types)
+both_train_dataset = CombinedEmbeddedDataset(
+    [gabor_dataset, ni_dataset], [gabor_train_inds, ni_train_inds], keys_lags, 'cpu'
+)
+both_val_dataset = CombinedEmbeddedDataset(
+    [gabor_dataset, ni_dataset], [gabor_val_inds, ni_val_inds], keys_lags, 'cpu'
+)
+both_test_dataset = CombinedEmbeddedDataset(
+    [gabor_dataset, ni_dataset], [gabor_test_inds, ni_test_inds], keys_lags, 'cpu'
+)
+
+print("Dataset creation completed!")
+
+#%%
+# ============================================================================
+# 4.4 TEST DATASET STRUCTURE
+# ============================================================================
+
+# Examine the structure of our processed datasets
+print("Examining dataset structure...")
 test_batch = both_train_dataset[:64]
 
+print("Batch contents:")
 for k, v in test_batch.items():
-    print(k, v.shape)
-# %%
+    print(f"  {k}: {v.shape} ({v.dtype})")
 
-from utils.modules import WindowedConv2d, SplitRelu
-from utils.reg import laplacian, locality_conv, local_2d
+print(f"\nStimulus tensor interpretation:")
+print(f"  Shape: [batch_size, n_lags, height, width]")
+print(f"  Contains {test_batch['stim'].shape[1]} frames of stimulus history")
+print(f"  Spatial resolution: {test_batch['stim'].shape[2]} x {test_batch['stim'].shape[3]} pixels")
+
+# %%
+# ============================================================================
+# 5. NEURAL NETWORK ARCHITECTURE
+# ============================================================================
+"""
+This section defines the neural network architecture for modeling neural responses.
+We use a lightweight spatiotemporal CNN with residual connections to capture both spatial
+and temporal dependencies in the stimulus-response relationship.
+"""
 
 class SpatioTemporalResNet(nn.Module):
-    '''
-    A spatiotemporal cnn model with time only in the first layer.
-    '''
+    """
+    Spatiotemporal CNN with residual connections for modeling neural responses.
 
-    def __init__(self, n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates=None):
+    Architecture:
+    1. Temporal layer: Processes stimulus history with 1x1 convolutions
+    2. Spatial layers: Process spatial features with residual connections
+    3. Readout layer: Maps features to individual neuron predictions
+
+    The residual connections help with gradient flow during training and
+    allow the model to learn both simple and complex feature combinations.
+    """
+
+    def __init__(self, n_lags, n_y, n_x, n_units, temporal_channels, res_channels,
+                 kernel_size, n_layers, baseline_rates=None):
+        """
+        Parameters
+        ----------
+        n_lags : int
+            Number of stimulus history frames
+        n_y, n_x : int
+            Spatial dimensions of stimulus
+        n_units : int
+            Number of neurons to model
+        temporal_channels : int
+            Number of channels after temporal processing
+        res_channels : int
+            Number of channels in residual layers
+        kernel_size : int
+            Spatial kernel size for convolutional layers
+        n_layers : int
+            Number of spatial processing layers
+        baseline_rates : array-like, optional
+            Baseline firing rates for initializing readout bias
+        """
         super(SpatioTemporalResNet, self).__init__()
 
-        self.temporal_layer = nn.Conv2d(n_lags, temporal_channels, kernel_size=1, bias=False) 
-        self.temporal_activation = SplitRelu()
+        # Temporal processing: combine stimulus history
+        self.temporal_layer = nn.Conv2d(n_lags, temporal_channels, kernel_size=1, bias=False)
+        self.temporal_activation = SplitRelu()  # Separate positive/negative channels
+
+        # Spatial processing layers with residual connections
         self.layers = nn.ModuleList()
         self.kernel_size = kernel_size
         self.n_layers = n_layers
-        
-        for iC in range(n_layers):
-            self.layers.append(WindowedConv2d(temporal_channels*2 if iC == 0 else res_channels, 
-                                              res_channels, kernel_size=kernel_size, bias=True))
 
-        # Add projection layer if temporal_channels != res_channels
-        if temporal_channels != res_channels:
-            self.channel_projection = nn.Conv2d(temporal_channels*2, res_channels, kernel_size=1, bias=False)
+        for iC in range(n_layers):
+            in_channels = temporal_channels*2 if iC == 0 else res_channels
+            self.layers.append(WindowedConv2d(in_channels, res_channels,
+                                            kernel_size=kernel_size, bias=True))
+
+        # Channel projection for residual connections (if needed)
+        if temporal_channels*2 != res_channels:
+            self.channel_projection = nn.Conv2d(temporal_channels*2, res_channels,
+                                              kernel_size=1, bias=False)
         else:
             self.channel_projection = None
 
+        # Calculate output spatial dimensions after convolutions
         contraction = (kernel_size - 1) * n_layers
         output_dims = [res_channels, n_y - contraction, n_x - contraction]
+
+        # Readout layer: map spatial features to neuron responses
         self.readout = NonparametricReadout(output_dims, n_units, bias=True)
 
-        inv_softplus = lambda x, beta=1: torch.log(torch.exp(beta*x) - 1) / beta
+        # Initialize readout bias with baseline firing rates
         if baseline_rates is not None:
-            assert len(baseline_rates) == n_units, 'init_rates must have the same length as n_units'
+            assert len(baseline_rates) == n_units, 'baseline_rates must match n_units'
+            # Convert rates to log-space for softplus activation
+            inv_softplus = lambda x: torch.log(torch.exp(x) - 1)
             self.readout.bias.data = inv_softplus(
                 ensure_tensor(baseline_rates, device=self.readout.bias.device)
             )
 
     def forward(self, batch, debug=False):
-        x = batch['stim']
-        if debug:
-            print(f'Input: {x.shape}')
-        x = self.temporal_layer(x)
-        x = self.temporal_activation(x)
-        if debug:
-            print(f'Temporal: {x.shape}')
+        """
+        Forward pass through the network.
 
-        # Store the first layer input for residual connections
+        Parameters
+        ----------
+        batch : dict
+            Batch containing 'stim' key with stimulus tensor
+        debug : bool, optional
+            If True, print intermediate tensor shapes
+
+        Returns
+        -------
+        dict
+            Input batch with added 'rhat' key containing predictions
+        """
+        x = batch['stim']  # Shape: [batch, n_lags, height, width]
+        if debug:
+            print(f'Input stimulus: {x.shape}')
+
+        # Temporal processing: combine stimulus history
+        x = self.temporal_layer(x)  # Shape: [batch, temporal_channels, height, width]
+        x = self.temporal_activation(x)  # Shape: [batch, temporal_channels*2, height, width]
+        if debug:
+            print(f'After temporal processing: {x.shape}')
+
+        # Store input for residual connections
         residual = x
         if self.channel_projection is not None:
             residual = self.channel_projection(residual)
 
+        # Spatial processing with residual connections
         for i, layer in enumerate(self.layers):
-            x = layer(x)
-            x = F.relu(x)
-            
+            x = layer(x)  # Spatial convolution
+            x = F.relu(x)  # Nonlinearity
+
             # Add residual connection (crop residual to match current x size)
             if residual.shape[-2:] != x.shape[-2:]:
-                # Calculate how much to crop from each side
+                # Calculate spatial cropping needed due to convolution
                 h_diff = residual.shape[-2] - x.shape[-2]
                 w_diff = residual.shape[-1] - x.shape[-1]
                 h_crop = h_diff // 2
                 w_crop = w_diff // 2
                 residual = residual[..., h_crop:h_crop+x.shape[-2], w_crop:w_crop+x.shape[-1]]
-            
-            x = x + residual
+
+            x = x + residual  # Residual connection
             residual = x  # Update residual for next layer
-            
+
             if debug:
-                print(f'Layer {i+1}: {x.shape}')
-                
-        x = self.readout(x)
+                print(f'After spatial layer {i+1}: {x.shape}')
+
+        # Readout: map spatial features to neuron predictions
+        x = self.readout(x)  # Shape: [batch, n_units]
         if debug:
-            print(f'Readout: {x.shape}')
+            print(f'After readout: {x.shape}')
+
+        # Apply softplus to ensure positive firing rates
         batch['rhat'] = F.softplus(x)
         return batch
-    
+
     def temporal_smoothness_regularization(self):
+        """
+        Compute temporal smoothness regularization term.
+
+        Returns
+        -------
+        torch.Tensor
+            Regularization loss term
+        """
         return laplacian(self.temporal_layer.weight, dims=1)
-    
-    def plot_weights(self):
+
+    def plot_weights(self, name=None):
+        """Visualize learned model weights."""
+        prepend = (name + ' - ') if name is not None else ''
+        # Plot temporal filters
         temporal_weights = self.temporal_layer.weight.detach().cpu().numpy()
-        plt.figure()
+        plt.figure(figsize=(10, 6))
         plt.plot(temporal_weights.squeeze().T)
-        plt.title('Temporal Weights')
+        plt.xlabel('Time Lag')
+        plt.ylabel('Weight')
+        plt.title(prepend + 'Learned Temporal Filters')
+        plt.grid(True, alpha=0.3)
         plt.show()
+
+        # Plot spatial filters for each layer
         for i, layer in enumerate(self.layers):
             if hasattr(layer, 'plot_weights'):
-                fig, axs = layer.plot_weights()
-                fig.suptitle(f'Layer {i+1}')
+                fig, _ = layer.plot_weights()
+                fig.suptitle(prepend + f'Spatial Layer {i+1} Filters')
                 plt.show()
-        fig, axs = self.readout.plot_weights()
-        fig.suptitle(f'Readout')
+
+        # Plot readout weights
+        fig, _ = self.readout.plot_weights()
+        fig.suptitle(prepend + 'Readout Weights (Spatial to Neural Mapping)')
         plt.show()
-
-# Update the model instantiation
-_, n_y, n_x = gabor_dataset['stim'].shape
-n_units = gabor_dataset['robs'].shape[1]
-temporal_channels = 4
-res_channels = 8
-kernel_size = 13
-n_layers = 4
-
-baseline_rates = (gabor_dataset['robs'][gabor_train_inds] * gabor_dataset['dfs'][gabor_train_inds]).sum(0) / gabor_dataset['dfs'][gabor_train_inds].sum(0)
-
-model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates)
-
-batch = model(test_batch, True)
-model.plot_weights()
 
 #%%
+# ============================================================================
+# 5.1 MODEL INSTANTIATION AND TESTING
+# ============================================================================
 
-class SpatioTemporalCNN(nn.Module):
-    '''
-    A spatiotemporal cnn model with time only in the first layer.
-    '''
+# Get dataset dimensions for model architecture
+_, n_y, n_x = gabor_dataset['stim'].shape
+n_units = gabor_dataset['robs'].shape[1]
 
-    def __init__(self, n_lags, n_y, n_x, n_units, channels, activations, kernel_sizes, baseline_rates=None):
-        super(SpatioTemporalCNN, self).__init__()
+# Model hyperparameters
+temporal_channels = 4   # Number of temporal feature channels
+res_channels = 8       # Number of channels in residual layers
+kernel_size = 13       # Spatial kernel size (13x13 pixels)
+n_layers = 4          # Number of spatial processing layers
 
-        self.temporal_layer = nn.Conv2d(n_lags, channels[0], kernel_size=1, bias=False) 
-        self.layers = nn.ModuleList()
-        self.layers.append(activations[0])
-        for iC in range(len(channels) - 1):
-            prev_channels = channels[iC] * 2 if isinstance(activations[iC], SplitRelu) else channels[iC]
-            self.layers.append(WindowedConv2d(prev_channels, channels[iC+1], kernel_size=kernel_sizes[iC], bias=False))
-            self.layers.append(activations[iC+1])
+print(f"Model architecture parameters:")
+print(f"  Input dimensions: {n_lags} lags × {n_y} × {n_x} pixels")
+print(f"  Output units: {n_units} neurons")
+print(f"  Temporal channels: {temporal_channels}")
+print(f"  Spatial channels: {res_channels}")
+print(f"  Kernel size: {kernel_size}×{kernel_size}")
+print(f"  Spatial layers: {n_layers}")
 
-        contraction = np.sum(kernel_sizes) - len(kernel_sizes) 
-        output_dims = [channels[-1], n_y - contraction, n_x - contraction]
-        if isinstance(activations[-1], SplitRelu):
-            output_dims[0] *= 2
-        self.readout = NonparametricReadout(output_dims, n_units, bias=True)
+# Calculate baseline firing rates for initialization
+baseline_rates = (gabor_dataset['robs'][gabor_train_inds] * gabor_dataset['dfs'][gabor_train_inds]).sum(0) / gabor_dataset['dfs'][gabor_train_inds].sum(0)
+print(f"Baseline firing rates: {baseline_rates.mean():.3f} ± {baseline_rates.std():.3f} spikes/bin")
 
-        inv_softplus = lambda x, beta=1: torch.log(torch.exp(beta*x) - 1) / beta
-        if baseline_rates is not None:
-            assert len(baseline_rates) == n_units, 'init_rates must have the same length as n_units'
-            self.readout.bias.data = inv_softplus(
-                ensure_tensor(baseline_rates, device=self.readout.bias.device)
-            )
+# Create and test model
+print("\nCreating ResNet model...")
+model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates)
 
-    def forward(self, batch, debug=False):
-        x = batch['stim']
-        if debug:
-            print(f'Input: {x.shape}')
-        x = self.temporal_layer(x)
-        if debug:
-            print(f'Temporal: {x.shape}')
+print("Testing forward pass...")
+batch = model(test_batch, debug=True)
+print(f"✅ Model forward pass successful!")
+print(f"   Prediction shape: {batch['rhat'].shape}")
+print(f"   Prediction range: {batch['rhat'].min():.3f} - {batch['rhat'].max():.3f}")
 
-        for layer in self.layers:
-            x = layer(x)
-            if debug:
-                print(f'Layer {layer}: {x.shape}')
-        x = self.readout(x)
-        if debug:
-            print(f'Readout: {x.shape}')
-        batch['rhat'] = F.softplus(x)
-        return batch
-
-    def temporal_smoothness_regularization(self):
-        return laplacian(self.temporal_layer.weight, dims=1)
-    
-    def plot_weights(self):
-        temporal_weights = self.temporal_layer.weight.detach().cpu().numpy()
-        plt.figure()
-        plt.plot(temporal_weights.squeeze().T)
-        plt.title('Temporal Weights')
-        plt.show()
-        for i, layer in enumerate(self.layers):
-            if hasattr(layer, 'plot_weights'):
-                fig, axs = layer.plot_weights()
-                fig.suptitle(f'Layer {i+1}')
-                plt.show()
-        fig, axs = self.readout.plot_weights()
-        fig.suptitle(f'Readout')
-        plt.show()
-        
-channels = [4, 8, 8]
-activations = [SplitRelu(), SplitRelu(), SplitRelu()]
-kernel_sizes = [16, 16]
-
-model = SpatioTemporalCNN(n_lags, n_y, n_x, n_units, channels, activations, kernel_sizes, baseline_rates)
-
-batch = model(test_batch, True)
-
+print("\nVisualizing initial model weights...")
 model.plot_weights()
+
 # %%
 # ============================================================================
-# 3. TRAINING FUNCTION
+# 6. MODEL TRAINING FRAMEWORK
 # ============================================================================
+"""
+This section implements the training pipeline for neural network models.
+We use Poisson loss (appropriate for spike count data) with data filtering
+and regularization to prevent overfitting.
+
+Key components:
+1. Masked Poisson loss: Handles variable data quality
+2. Early stopping: Prevents overfitting
+3. Regularization: Encourages smooth temporal filters, which may be more biologically plausible
+"""
 
 def masked_poisson_nll_loss(output, target, dfs=None):
     """
     Compute masked Poisson negative log-likelihood loss.
 
+    The Poisson distribution is appropriate for modeling neural spike counts
+    because spikes are discrete events with a natural rate parameter.
+
+    The masking allows us to exclude low-quality time periods from training,
+    which is crucial when working with real neural data.
+
     Parameters
     ----------
     output : torch.Tensor
-        Model predictions
+        Model predictions (firing rates), shape [batch, n_units]
     target : torch.Tensor
-        Target values
+        Target spike counts, shape [batch, n_units]
     dfs : torch.Tensor, optional
-        Degrees of freedom mask for weighting samples
+        Quality mask (degrees of freedom), shape [batch, n_units] or [batch, 1]
+        Values should be 0 (exclude) or 1 (include)
 
     Returns
     -------
     torch.Tensor
-        Computed loss
+        Computed loss (scalar)
     """
+    # Compute Poisson NLL for each sample and unit
     loss = F.poisson_nll_loss(output, target, log_input=False, full=False, reduction='none')
+
     if dfs is not None:
+        # Expand mask if needed
         if dfs.shape[1] == 1:
             dfs = dfs.expand(-1, loss.shape[1])
+
+        # Apply quality mask and normalize by valid samples
         loss = loss * dfs
         loss = loss.sum() / dfs.sum()
     else:
+        # Simple average if no masking
         loss = loss.mean()
+
     return loss
 
+
+#%%
+# ============================================================================
+# 6.1 TRAINING FUNCTION
+# ============================================================================
 
 def train_model(model, train_dataset, val_dataset,
                 n_epochs=10, lr=3e-3, weight_decay=1e-4,
@@ -669,71 +1097,88 @@ def train_model(model, train_dataset, val_dataset,
                 device='cuda', num_workers=None, plot_weights=True,
                 verbose=True):
     """
-    Train a spatiotemporal model on neural data.
+    Train a spatiotemporal CNN model on neural data with comprehensive monitoring.
+
+    This function implements best practices for neural network training:
+    - Early stopping to prevent overfitting
+    - Learning rate scheduling (via AdamW optimizer)
+    - Regularization for biologically plausible filters
+    - Comprehensive metrics tracking (loss and bits per spike)
+    - Quality masking for real neural data
+
+    The "bits per spike" metric is particularly important in computational
+    neuroscience - it measures how much information the model captures
+    about each spike, with higher values indicating better predictions.
 
     Parameters
     ----------
     model : nn.Module
         The model to train (SpatioTemporalResNet or SpatioTemporalCNN)
-    train_dataset : Dataset
-        Training dataset
-    val_dataset : Dataset
-        Validation dataset
+    train_dataset : CombinedEmbeddedDataset
+        Training dataset with stimulus and response data
+    val_dataset : CombinedEmbeddedDataset
+        Validation dataset for monitoring overfitting
     n_epochs : int, optional
-        Number of training epochs. Default is 10.
+        Maximum number of training epochs. Default is 10.
     lr : float, optional
-        Learning rate. Default is 3e-3.
+        Learning rate for AdamW optimizer. Default is 3e-3.
     weight_decay : float, optional
-        Weight decay for optimizer. Default is 1e-4.
+        L2 regularization strength. Default is 1e-4.
     smoothness_lambda : float, optional
-        Regularization strength for temporal smoothness. Default is 1e-4.
+        Temporal smoothness regularization strength. Default is 1e-4.
     batch_size : int, optional
         Batch size for training. Default is 256.
     patience : int, optional
-        Early stopping patience. Default is 2.
+        Early stopping patience (epochs without improvement). Default is 2.
     device : str, optional
-        Device to train on. Default is 'cuda'.
+        Device for computation ('cuda' or 'cpu'). Default is 'cuda'.
     num_workers : int, optional
         Number of workers for data loading. Default is os.cpu_count()//2.
     plot_weights : bool, optional
-        Whether to plot model weights each epoch. Default is True.
+        Whether to visualize model weights each epoch. Default is True.
     verbose : bool, optional
-        Whether to print training progress. Default is True.
+        Whether to print detailed training progress. Default is True.
 
     Returns
     -------
     dict
-        Dictionary containing:
-        - 'model': trained model with best weights loaded
+        Comprehensive training results containing:
+        - 'model': trained model with best validation weights loaded
         - 'train_losses': list of training losses per epoch
         - 'val_losses': list of validation losses per epoch
         - 'train_bps': list of training bits per spike per epoch
         - 'val_bps': list of validation bits per spike per epoch
         - 'step_losses': list of losses per training step
-        - 'step_numbers': list of step numbers
-        - 'best_epoch': epoch with best validation loss
+        - 'step_numbers': list of step numbers for plotting
+        - 'best_epoch': epoch number with best validation performance
     """
+    # ========================================================================
+    # TRAINING SETUP
+    # ========================================================================
+
     if num_workers is None:
         num_workers = os.cpu_count() // 2
 
-    # Create data loaders
+    # Create data loaders with appropriate settings
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True if device == 'cuda' else False
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True if device == 'cuda' else False
     )
 
-    # Move model to device
+    # Move model to computation device
     model = model.to(device)
 
-    # Setup optimizer
+    # Setup AdamW optimizer (better than Adam for most cases)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Initialize BPS aggregator
+    # Initialize bits-per-spike aggregator for performance monitoring
     bps_agg = PoissonBPSAggregator()
 
-    # Lists to store metrics
+    # Initialize metric tracking lists
     train_losses = []
     train_bps = []
     val_losses = []
@@ -748,82 +1193,104 @@ def train_model(model, train_dataset, val_dataset,
     step = 0
 
     if verbose:
-        print(f"Starting training for {n_epochs} epochs...")
-        print(f"Training batches per epoch: {len(train_loader)}")
+        print(f"🚀 Starting training for up to {n_epochs} epochs...")
+        print(f"   Training batches per epoch: {len(train_loader)}")
+        print(f"   Validation batches per epoch: {len(val_loader)}")
+        print(f"   Device: {device}")
+        print(f"   Optimizer: AdamW (lr={lr}, weight_decay={weight_decay})")
+        print(f"   Early stopping patience: {patience} epochs")
 
-    # Training loop
+    # ========================================================================
+    # MAIN TRAINING LOOP
+    # ========================================================================
+
     for epoch in range(n_epochs):
         if verbose:
-            print(f"\nEpoch {epoch+1}/{n_epochs}")
+            print(f"\n{'='*60}")
+            print(f"EPOCH {epoch+1}/{n_epochs}")
+            print(f"{'='*60}")
 
+        # Visualize model weights (helpful for debugging)
         if plot_weights and hasattr(model, 'plot_weights'):
+            print("📊 Current model weights:")
             model.plot_weights()
 
-        # Training phase
-        model.train()
+        # ====================================================================
+        # TRAINING PHASE
+        # ====================================================================
+        model.train()  # Set model to training mode
         epoch_train_losses = []
         bps_agg.reset()
 
-        train_pbar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}", disable=not verbose)
+        train_pbar = tqdm(train_loader, desc=f"🔥 Training", disable=not verbose)
         for batch in train_pbar:
-            # Move batch to device
+            # Move batch to computation device
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # Forward pass
             optimizer.zero_grad()
             batch = model(batch)
 
-            # Accumulate for BPS calculation
+            # Accumulate predictions for BPS calculation
             bps_agg(batch)
 
-            # Calculate loss
+            # Calculate primary loss (Poisson NLL with quality masking)
             loss = masked_poisson_nll_loss(batch['rhat'], batch['robs'], batch['dfs'])
 
-            # Add smoothness regularization if model supports it
+            # Add temporal smoothness regularization (encourages smooth filters)
             if hasattr(model, 'temporal_smoothness_regularization'):
-                loss += smoothness_lambda * model.temporal_smoothness_regularization()
+                reg_loss = model.temporal_smoothness_regularization()
+                loss += smoothness_lambda * reg_loss
 
-            # Backward pass
+            # Backward pass and optimization step
             loss.backward()
             optimizer.step()
 
-            # Store loss for plotting
+            # Track training progress
             step_loss = loss.item()
             step_losses.append(step_loss)
             step_numbers.append(step)
             epoch_train_losses.append(step_loss)
 
-            # Update progress bar
+            # Update progress bar with current loss
             if verbose:
-                train_pbar.set_postfix({'loss': f'{step_loss:.4f}'})
+                train_pbar.set_postfix({
+                    'loss': f'{step_loss:.4f}',
+                    'step': step
+                })
             step += 1
 
-        # Calculate average training loss for epoch
+        # Calculate epoch-level training metrics
         avg_train_loss = np.mean(epoch_train_losses)
         train_losses.append(avg_train_loss)
         train_bps.append(bps_agg.closure().cpu().numpy())
         bps_agg.reset()
 
         if verbose:
-            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Train BPS: {train_bps[-1].mean():.4f}")
+            print(f"📈 Training Results:")
+            print(f"   Average Loss: {avg_train_loss:.4f}")
+            print(f"   Average BPS: {train_bps[-1].mean():.4f} ± {train_bps[-1].std():.4f}")
 
-        # Validation phase
-        model.eval()
+        # ====================================================================
+        # VALIDATION PHASE
+        # ====================================================================
+        model.eval()  # Set model to evaluation mode (disables dropout, etc.)
         val_loss_total = 0
         val_samples = 0
 
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"Validation Epoch {epoch+1}", disable=not verbose)
+        with torch.no_grad():  # Disable gradient computation for efficiency
+            val_pbar = tqdm(val_loader, desc=f"🔍 Validation", disable=not verbose)
             for batch in val_pbar:
                 # Move batch to device
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                # Forward pass
+                # Forward pass (no gradients needed)
                 batch = model(batch)
 
                 # Calculate validation loss
                 val_loss = masked_poisson_nll_loss(batch['rhat'], batch['robs'], batch['dfs'])
 
+                # Accumulate weighted loss (important for proper averaging with masking)
                 n_samples = batch['dfs'].sum().item()
                 val_loss_total += val_loss.item() * n_samples
                 val_samples += n_samples
@@ -835,7 +1302,7 @@ def train_model(model, train_dataset, val_dataset,
                 if verbose:
                     val_pbar.set_postfix({'loss': f'{val_loss.item():.4f}'})
 
-        # Calculate validation metrics
+        # Calculate epoch-level validation metrics
         avg_val_loss = val_loss_total / val_samples if val_samples > 0 else 0
         val_losses.append(avg_val_loss)
 
@@ -844,34 +1311,69 @@ def train_model(model, train_dataset, val_dataset,
         bps_agg.reset()
 
         if verbose:
-            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val BPS: {val_bps[-1].mean():.4f}")
+            print(f"📊 Validation Results:")
+            print(f"   Average Loss: {avg_val_loss:.4f}")
+            print(f"   Average BPS: {val_bps[-1].mean():.4f} ± {val_bps[-1].std():.4f}")
 
-        # Early stopping
+        # ====================================================================
+        # EARLY STOPPING LOGIC
+        # ====================================================================
+
+        # Check if validation performance improved
         if epoch > 0 and val_losses[-1] >= best_val_loss:
             patience_count += 1
             if verbose:
-                print(f"❌ Validation loss did not improve from {val_losses[-2]:.4f} to {val_losses[-1]:.4f}")
+                print(f"⚠️  No improvement: {val_losses[-2]:.4f} → {val_losses[-1]:.4f}")
+                print(f"   Patience: {patience_count}/{patience}")
+
+            # Stop training if patience exceeded
             if patience_count >= patience:
                 if verbose:
-                    print(f"Early stopping at epoch {epoch+1}: No improvement in validation loss for {patience} epochs")
+                    print(f"🛑 Early stopping triggered!")
+                    print(f"   No improvement for {patience} consecutive epochs")
                 break
         else:
+            # Validation improved - save best model state
             best_val_loss = val_losses[-1]
             patience_count = 0
+
             if epoch > 0 and verbose:
-                print(f"✅ Validation loss improved from {val_losses[-2]:.4f} to {val_losses[-1]:.4f}")
+                print(f"✅ Validation improved: {val_losses[-2]:.4f} → {val_losses[-1]:.4f}")
+
+            # Save the best model weights
             best_state = copy.deepcopy(model.state_dict())
 
-    # Load best model state
-    best_epoch = np.argmin(val_losses)
-    if verbose:
-        print("\nTraining completed!")
-        print(f"Best validation bits per spike: {val_bps[best_epoch].mean():.4f} on epoch {best_epoch+1}")
-        print(f'Loading best model from epoch {best_epoch+1}')
+    # ========================================================================
+    # TRAINING COMPLETION AND MODEL RESTORATION
+    # ========================================================================
 
+    # Find the epoch with best validation performance
+    best_epoch = np.argmin(val_losses)
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"🎯 TRAINING COMPLETED!")
+        print(f"{'='*60}")
+        print(f"Total epochs run: {len(val_losses)}")
+        print(f"Best epoch: {best_epoch+1}")
+        print(f"Best validation loss: {val_losses[best_epoch]:.4f}")
+        print(f"Best validation BPS: {val_bps[best_epoch].mean():.4f} ± {val_bps[best_epoch].std():.4f}")
+
+        if patience_count >= patience:
+            print(f"Training stopped early due to no improvement")
+        else:
+            print(f"Training completed all {n_epochs} epochs")
+
+    # Restore the best model weights
     if best_state is not None:
         model.load_state_dict(best_state)
+        if verbose:
+            print(f"✅ Loaded best model weights from epoch {best_epoch+1}")
+    else:
+        if verbose:
+            print("⚠️  No best state saved - using final model weights")
 
+    # Return comprehensive training results
     return {
         'model': model,
         'train_losses': train_losses,
@@ -883,7 +1385,25 @@ def train_model(model, train_dataset, val_dataset,
         'best_epoch': best_epoch
     }
 
+#%%
+# ============================================================================
+# 6.2 TRAINING VISUALIZATION FUNCTION
+# ============================================================================
+
 def plot_training_summary(training_results):
+    """
+    Create comprehensive visualization of training progress.
+
+    Shows three key aspects:
+    1. Step-by-step training loss (shows convergence behavior)
+    2. Epoch-level train/val loss (shows overfitting)
+    3. Epoch-level train/val BPS (shows model performance)
+
+    Parameters
+    ----------
+    training_results : dict
+        Results dictionary from train_model function
+    """
     # Extract results
     train_losses = training_results['train_losses']
     val_losses = training_results['val_losses']
@@ -891,121 +1411,228 @@ def plot_training_summary(training_results):
     val_bps = training_results['val_bps']
     step_losses = training_results['step_losses']
     step_numbers = training_results['step_numbers']
-    # Create plots
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle('Training Results', fontsize=16)
+    best_epoch = training_results['best_epoch']
 
-    # Plot 1: Training loss per step
-    axes[0].plot(step_numbers, step_losses, alpha=0.7, linewidth=0.5)
+    # Create comprehensive plot
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle('Training Progress Summary', fontsize=16, fontweight='bold')
+
+    # Plot 1: Training loss per step (shows detailed convergence)
+    axes[0].plot(step_numbers, step_losses, alpha=0.7, linewidth=0.8, color='steelblue')
     axes[0].set_xlabel('Training Step')
     axes[0].set_ylabel('Poisson NLL Loss')
-    axes[0].set_title('Training Loss per Step')
+    axes[0].set_title('Training Loss per Step\n(Shows convergence behavior)')
     axes[0].grid(True, alpha=0.3)
 
-    # Plot 2: Training and validation loss
-    axes[1].plot(range(1, len(train_losses) + 1), train_losses, 'b-o', label='Training Loss')
-    axes[1].plot(range(1, len(val_losses) + 1), val_losses, 'r-o', label='Validation Loss')
+    # Plot 2: Training and validation loss per epoch
+    epochs = range(1, len(train_losses) + 1)
+    axes[1].plot(epochs, train_losses, 'b-o', label='Training Loss', markersize=4)
+    axes[1].plot(epochs, val_losses, 'r-o', label='Validation Loss', markersize=4)
+    axes[1].axvline(best_epoch + 1, color='green', linestyle='--', alpha=0.7, label=f'Best Epoch ({best_epoch+1})')
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Average Poisson NLL Loss')
-    axes[1].set_title('Training vs Validation Loss')
+    axes[1].set_title('Training vs Validation Loss\n(Shows overfitting)')
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
     # Plot 3: Training and validation bits per spike
-    axes[2].plot(range(1, len(train_bps) + 1), np.mean(np.array(train_bps), axis=1), 'b-o', label='Training BPS')
-    axes[2].plot(range(1, len(val_bps) + 1), np.mean(np.array(val_bps), axis=1), 'r-o', label='Validation BPS')
+    train_bps_mean = np.array([bps.mean() for bps in train_bps])
+    val_bps_mean = np.array([bps.mean() for bps in val_bps])
+
+    axes[2].plot(epochs, train_bps_mean, 'b-o', label='Training BPS', markersize=4)
+    axes[2].plot(epochs, val_bps_mean, 'r-o', label='Validation BPS', markersize=4)
+    axes[2].axvline(best_epoch + 1, color='green', linestyle='--', alpha=0.7, label=f'Best Epoch ({best_epoch+1})')
+    axes[2].axhline(0, color='black', linestyle=':', alpha=0.5, label='Chance Level')
     axes[2].set_xlabel('Epoch')
     axes[2].set_ylabel('Bits per Spike')
-    axes[2].set_title('Training vs Validation BPS')
+    axes[2].set_title('Model Performance (BPS)\n(Higher is better)')
     axes[2].grid(True, alpha=0.3)
     axes[2].legend()
 
     plt.tight_layout()
     plt.show()
 
+    # Print summary statistics
+    print(f"\n📊 Training Summary:")
+    print(f"   Final training BPS: {train_bps_mean[-1]:.4f}")
+    print(f"   Final validation BPS: {val_bps_mean[-1]:.4f}")
+    print(f"   Best validation BPS: {val_bps_mean[best_epoch]:.4f} (epoch {best_epoch+1})")
+    print(f"   Performance gap: {train_bps_mean[-1] - val_bps_mean[-1]:.4f} BPS")
+
 
 
 
 # %%
 # ============================================================================
-# 3. EXAMPLE USAGE OF TRAINING FUNCTION
+# 7. MODEL TRAINING EXPERIMENTS
+# ============================================================================
+"""
+Now we train three different models to test our main research question:
+Do CNN models trained on one visual stimulus generalize to different conditions?
+
+We train:
+1. Gabor-only model: Trained only on Gabor stimuli
+2. Natural images-only model: Trained only on natural images
+3. Combined model: Trained on both stimulus types
+
+This experimental design allows us to test cross-condition generalization.
+"""
+
+#%%
+# ============================================================================
+# 7.1 TRAINING CONFIGURATION
 # ============================================================================
 
-# Training parameters
+# Define training hyperparameters
 training_config = {
-    'n_epochs': 10,
-    'lr': 3e-3,
-    'weight_decay': 1e-4,
-    'smoothness_lambda': 1e-4,
-    'batch_size': 256,
-    'patience': 2,
-    'device': device,
-    'plot_weights': True,
-    'verbose': True
+    'n_epochs': 20,              # Maximum epochs (early stopping may end sooner)
+    'lr': 1e-3,                  # Learning rate
+    'weight_decay': 1e-4,        # L2 regularization strength
+    'smoothness_lambda': 1e-4,   # Temporal smoothness regularization
+    'batch_size': 256,           # Batch size 
+    'patience': 2,               # Early stopping patience
+    'device': device,            # Use GPU if available
+    'plot_weights': False,        # Visualize weights during training
+    'verbose': True              # Print detailed progress
 }
 
-# Create model
-gabor_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates)
+#%%
+# ============================================================================
+# 7.2 EXPERIMENT 1: GABOR-ONLY MODEL
+# ============================================================================
+
+print(f"\nTraining model on Gabor stimuli only")
+print(f"Training samples: {len(gabor_train_dataset):,}")
+print(f"Validation samples: {len(gabor_val_dataset):,}")
+
+# Create fresh model for Gabor training
+gabor_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels,
+                                  res_channels, kernel_size, n_layers, baseline_rates)
+
+# Train the model
 gabor_results = train_model(
     model=gabor_model,
     train_dataset=gabor_train_dataset,
     val_dataset=gabor_val_dataset,
     **training_config
 )
+
+# Visualize training progress
+print("\nGabor Model Training Summary:")
 plot_training_summary(gabor_results)
 
 #%%
-ni_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates)
+# ============================================================================
+# 7.3 EXPERIMENT 2: NATURAL IMAGES-ONLY MODEL
+# ============================================================================
+
+print(f"\nTraining model on Natural Images only")
+print(f"Training samples: {len(ni_train_dataset):,}")
+print(f"Validation samples: {len(ni_val_dataset):,}")
+
+# Create fresh model for Natural Images training
+ni_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels,
+                               res_channels, kernel_size, n_layers, baseline_rates)
+
+# Train the model
 ni_results = train_model(
     model=ni_model,
     train_dataset=ni_train_dataset,
     val_dataset=ni_val_dataset,
     **training_config
 )
+
+# Visualize training progress
+print("\nNatural Images Model Training Summary:")
 plot_training_summary(ni_results)
 
 #%%
-both_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels, res_channels, kernel_size, n_layers, baseline_rates)
+# ============================================================================
+# 7.4 EXPERIMENT 3: COMBINED MODEL
+# ============================================================================
+
+print(f"\nTraining model on both stimulus types")
+print(f"Training samples: {len(both_train_dataset):,}")
+print(f"Validation samples: {len(both_val_dataset):,}")
+
+# Create fresh model for combined training
+both_model = SpatioTemporalResNet(n_lags, n_y, n_x, n_units, temporal_channels,
+                                 res_channels, kernel_size, n_layers, baseline_rates)
+
+# Train the model
 both_results = train_model(
     model=both_model,
     train_dataset=both_train_dataset,
     val_dataset=both_val_dataset,
     **training_config
 )
+
+# Visualize training progress
+print("\nCombined Model Training Summary:")
 plot_training_summary(both_results)
 
 
 #%%
 # ============================================================================
-# 4. PLOTTING RESULTS
+# 7.5 COMPARE TRAINED MODELS
 # ============================================================================
 
-plot_training_summary(gabor_results)
-plot_training_summary(ni_results)
-plot_training_summary(both_results)
-# %%
+print("\n🔍 COMPARING TRAINED MODELS")
+print("=" * 60)
+
+# Extract trained models for easier reference
 gabor_model = gabor_results['model']
-gabor_model.plot_weights()
 ni_model = ni_results['model']
-ni_model.plot_weights()
 both_model = both_results['model']
+
+# Compare training performance
+print("Training Performance Summary:")
+print(f"  Gabor model - Final val BPS: {gabor_results['val_bps'][-1].mean():.4f}")
+print(f"  NI model - Final val BPS: {ni_results['val_bps'][-1].mean():.4f}")
+print(f"  Combined model - Final val BPS: {both_results['val_bps'][-1].mean():.4f}")
+
+# Visualize learned features
+print("\nPlotting learned model weights...")
+
+print("\nGabor Model Weights:")
+gabor_model.plot_weights()
+
+print("\nNatural Images Model Weights:")
+ni_model.plot_weights()
+
+print("\nCombined Model Weights:")
 both_model.plot_weights()
 
+print("\nKey observations to look for:")
+print("- How do temporal filters differ between models?")
+print("- Are spatial filters qualitatively different for natural images?")
+
 #%%
 # ============================================================================
-# 5. MODEL EVALUATION ON TEST SETS
+# 8. CROSS-CONDITION GENERALIZATION TESTING
 # ============================================================================
+"""
+Now we will test how well each model generalizes across stimulus conditions. 
+
+We evaluate each model on both test sets to measure:
+1. Within-condition performance (how well models perform on trained stimuli)
+2. Cross-condition generalization (how well they transfer to out-of-distribution stimuli)
+"""
 
 def evaluate_model_on_dataset(model, dataset, batch_size=256, device='cuda', desc="Evaluating"):
     """
-    Evaluate a model on a dataset and return BPS per unit.
+    Evaluate a trained model on a test dataset.
+
+    This function computes the bits per spike (BPS) metric, which measures
+    how well the model predicts neural responses. Higher BPS indicates
+    better model performance.
 
     Parameters
     ----------
     model : nn.Module
         The trained model to evaluate
     dataset : CombinedEmbeddedDataset
-        The dataset to evaluate on
+        The test dataset to evaluate on
     batch_size : int, optional
         Batch size for evaluation. Default is 256.
     device : str, optional
@@ -1016,17 +1643,18 @@ def evaluate_model_on_dataset(model, dataset, batch_size=256, device='cuda', des
     Returns
     -------
     numpy.ndarray
-        Bits per spike for each unit
+        Bits per spike for each unit (shape: [n_units])
     """
-    model.eval()
+    model.eval()  # Set to evaluation mode
     bps_aggregator = PoissonBPSAggregator()
 
-    # Create data loader
+    # Create data loader (no shuffling needed for evaluation)
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=4
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True if device == 'cuda' else False
     )
 
-    with torch.no_grad():
+    with torch.no_grad():  # Disable gradients for efficiency
         for batch in tqdm(loader, desc=desc):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -1034,26 +1662,36 @@ def evaluate_model_on_dataset(model, dataset, batch_size=256, device='cuda', des
             # Forward pass
             batch = model(batch)
 
-            # Accumulate for BPS calculation
+            # Accumulate predictions for BPS calculation
             bps_aggregator(batch)
 
-    # Calculate final BPS
+    # Calculate final BPS per unit
     bps = bps_aggregator.closure().cpu().numpy()
     bps_aggregator.reset()
 
     return bps
 
-# Evaluate all three models on both test sets
-print("Evaluating models on test sets...")
-print("=" * 60)
+#%%
+# ============================================================================
+# 8.1 COMPREHENSIVE MODEL EVALUATION
+# ============================================================================
 
-# Dictionary to store all results
+print("\nEvaluating all models on both test sets...")
+
+# Dictionary to store all evaluation results
 evaluation_results = {}
 
-# Model names for cleaner plotting
+# Define models and test datasets
 model_names = ['Gabor Model', 'NI Model', 'Both Model']
 models = [gabor_model, ni_model, both_model]
-test_datasets = {'Gabor Test': gabor_test_dataset, 'NI Test': ni_test_dataset}
+test_datasets = {
+    'Gabor Test': gabor_test_dataset,
+    'NI Test': ni_test_dataset
+}
+
+print(f"\nTest set sizes:")
+for name, dataset in test_datasets.items():
+    print(f"  {name}: {len(dataset):,} samples")
 
 # Evaluate each model on each test set
 for model_idx, (model_name, model) in enumerate(zip(model_names, models)):
@@ -1061,36 +1699,63 @@ for model_idx, (model_name, model) in enumerate(zip(model_names, models)):
     print(f"\nEvaluating {model_name}...")
 
     for test_name, test_dataset in test_datasets.items():
-        print(f"  On {test_name}...")
+        print(f"   Testing on {test_name}...")
+
+        # Evaluate model performance
         bps = evaluate_model_on_dataset(
             model, test_dataset,
             batch_size=256, device=device,
-            desc=f"{model_name} on {test_name}"
+            desc=f"{model_name} → {test_name}"
         )
-        evaluation_results[model_name][test_name] = bps
-        print(f"    Mean BPS: {bps.mean():.4f} ± {bps.std():.4f}")
 
-print("\n" + "=" * 60)
-print("Evaluation completed!")
+        # Store results
+        evaluation_results[model_name][test_name] = bps
+
+        # Print summary statistics
+        print(f"     Mean BPS: {bps.mean():.4f} ± {bps.std():.4f}")
+        print(f"     Median BPS: {np.median(bps):.4f}")
+        print(f"     Units with BPS > 0: {np.sum(bps > 0)}/{len(bps)} ({np.sum(bps > 0)/len(bps)*100:.1f}%)")
+
+print("Cross-condition evaluation completed!")
 
 #%%
 # ============================================================================
-# 6. VISUALIZATION OF BPS DISTRIBUTIONS
+# 8.2 ANALYZE GENERALIZATION PATTERNS
+# ============================================================================
+
+for model_name in model_names:
+    gabor_bps = evaluation_results[model_name]['Gabor Test'].mean()
+    ni_bps = evaluation_results[model_name]['NI Test'].mean()
+
+    print(f"\n{model_name}:")
+    print(f"  Gabor Test BPS: {gabor_bps:.4f}")
+    print(f"  NI Test BPS: {ni_bps:.4f}")
+
+    if 'Gabor' in model_name:
+        print(f"  Cross-condition drop: {gabor_bps - ni_bps:.4f} BPS")
+    elif 'NI' in model_name:
+        print(f"  Cross-condition drop: {ni_bps - gabor_bps:.4f} BPS")
+
+#%%
+# ============================================================================
+# 8.3 VISUALIZATION OF RESULTS
 # ============================================================================
 
 def plot_bps_distributions(evaluation_results, min_bps=-10, save_path=None):
     """
-    Plot BPS distributions for all models and test sets.
+    Visualize of model performance across conditions.
 
     Parameters
     ----------
     evaluation_results : dict
         Dictionary containing BPS results for each model and test set
+    min_bps : float, optional
+        Minimum BPS value to display (clips very negative outliers)
     save_path : str, optional
         Path to save the plot. If None, plot is displayed.
     """
-    # Set up the figure
-    fig, axes = plt.subplots(1, 2, figsize=(8, 8))
+    # Set up the figure with publication-quality styling
+    fig, axes = plt.subplots(1, 2, figsize=(14, 8))
 
     # Colors for different models
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
@@ -1170,12 +1835,8 @@ def plot_bps_distributions(evaluation_results, min_bps=-10, save_path=None):
 
     plt.show()
 
-# Create the visualization
+# Create the key results visualization
+print("\n📈 Creating results visualization...")
 plot_bps_distributions(evaluation_results)
 
-#%%
-# The primary takeaway is that CNN models do not generalize across conditions, at least for this dataset
-
-
-
-
+# %%

@@ -2,6 +2,8 @@ import torch
 import numpy as np
 import os
 
+
+
 def ensure_tensor(x, device=None, dtype=None):
     """
     Ensures that the input is a torch.Tensor. If it is a numpy array, it is converted to a tensor.
